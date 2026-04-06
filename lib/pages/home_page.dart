@@ -1,9 +1,9 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
-import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:webdav_client/webdav_client.dart' as webdav;
+import 'package:file_picker/file_picker.dart'; // ==== 引入文件选择器 ====
 
 import '../models/sort_method.dart';
 import '../utils/note_util.dart';
@@ -68,29 +68,40 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
+  // ================= 修改：初始化目录逻辑 =================
   Future<void> _initRootDirectory() async {
-    try {
-      Directory? extDir = await getExternalStorageDirectory();
-      if (extDir != null) {
-        String rootPath = extDir.path.split('Android')[0];
-        String treeNotesPath = '$rootPath/Documents/TreeNotes';
+    final prefs = await SharedPreferences.getInstance();
+    String? savedPath = prefs.getString('root_path');
 
-        Directory notesDir = Directory(treeNotesPath);
-        if (!await notesDir.exists()) {
-          await notesDir.create(recursive: true);
-        }
-
-        setState(() {
-          _rootPath = treeNotesPath;
-          _currentPath = treeNotesPath;
-        });
-
-        await _loadFiles(_currentPath);
-      }
-    } catch (e) {
-      debugPrint("初始化目录失败: $e");
+    if (savedPath != null && Directory(savedPath).existsSync()) {
+      // 已经选过目录了，直接加载
+      setState(() {
+        _rootPath = savedPath;
+        _currentPath = savedPath;
+      });
+      await _loadFiles(_currentPath);
+    } else {
+      // 还没选过目录，关闭加载圈，让界面显示选择按钮
+      setState(() => _isLoading = false);
     }
   }
+
+  Future<void> _pickRootDirectory() async {
+    String? selectedDirectory = await FilePicker.getDirectoryPath();
+
+    if (selectedDirectory != null) {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('root_path', selectedDirectory);
+
+      setState(() {
+        _rootPath = selectedDirectory;
+        _currentPath = selectedDirectory;
+        _isLoading = true; // 重新显示加载圈，准备读取文件
+      });
+      await _loadFiles(_currentPath);
+    }
+  }
+  // =======================================================
 
   void _sortFiles() {
     _files.sort((a, b) {
@@ -279,7 +290,7 @@ class _HomePageState extends State<HomePage> {
     String davPwd = prefs.getString('dav_pwd') ?? '';
 
     if (davUrl.isEmpty || davUser.isEmpty || davPwd.isEmpty) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('请先在设置中配置 WebDAV 账号')));
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('请先在设��中配置 WebDAV 账号')));
       return;
     }
 
@@ -315,7 +326,6 @@ class _HomePageState extends State<HomePage> {
                   onTap: () { Navigator.pop(context); _showNameInputDialog(isFolder: true); },
                 ),
                 ListTile(
-                  // ======= 改为浅绿色 =======
                   leading: Container(padding: const EdgeInsets.all(8), decoration: BoxDecoration(color: Colors.lightGreen.shade50, borderRadius: BorderRadius.circular(8)), child: const Icon(Icons.description, color: Colors.lightGreen)),
                   title: const Text('新建笔记', style: TextStyle(fontSize: 16)),
                   onTap: () { Navigator.pop(context); _showNameInputDialog(isFolder: false); },
@@ -358,7 +368,6 @@ class _HomePageState extends State<HomePage> {
                   _loadFiles(_currentPath);
                 }
               },
-              // ======= 改为浅绿色 =======
               style: ElevatedButton.styleFrom(backgroundColor: isFolder ? Colors.amber.shade50 : Colors.lightGreen, foregroundColor: isFolder ? Colors.amber.shade900 : Colors.white, elevation: 0),
               child: const Text('确定'),
             ),
@@ -377,6 +386,38 @@ class _HomePageState extends State<HomePage> {
 
   @override
   Widget build(BuildContext context) {
+    // ================= 修改：如果是首次打开，要求选择目录 =================
+    if (_rootPath.isEmpty) {
+      return Scaffold(
+        appBar: AppBar(
+          title: const Text('欢迎使用 TreeNotes'),
+          backgroundColor: Theme.of(context).colorScheme.primaryContainer,
+        ),
+        body: Center(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              const Icon(Icons.folder_special, size: 80, color: Colors.lightGreen),
+              const SizedBox(height: 24),
+              const Text('请选择一个本地文件夹\n用来存放你所有的 Markdown 笔记', textAlign: TextAlign.center, style: TextStyle(fontSize: 16, color: Colors.grey)),
+              const SizedBox(height: 32),
+              ElevatedButton.icon(
+                onPressed: _pickRootDirectory,
+                icon: const Icon(Icons.create_new_folder),
+                label: const Text('选择笔记存储目录', style: TextStyle(fontSize: 16)),
+                style: ElevatedButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
+                  backgroundColor: Colors.lightGreen,
+                  foregroundColor: Colors.white,
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+    // ====================================================================
+
     bool canGoBack = _currentPath != _rootPath;
 
     return PopScope(
@@ -396,7 +437,6 @@ class _HomePageState extends State<HomePage> {
               ? IconButton(icon: const Icon(Icons.close), onPressed: () => setState(() => _selectedPaths.clear()))
               : (canGoBack ? IconButton(icon: const Icon(Icons.arrow_back), onPressed: _goBack) : null),
           title: Text(_isSelectionMode ? '已选择 ${_selectedPaths.length} 项' : (canGoBack ? _currentPath.split('/').last : 'TreeNotes')),
-          // ======= 改为浅绿色 =======
           backgroundColor: _isSelectionMode ? Colors.lightGreen.shade100 : Theme.of(context).colorScheme.primaryContainer,
           actions: _isSelectionMode 
             ? [
@@ -444,14 +484,12 @@ class _HomePageState extends State<HomePage> {
 
                           return ListTile(
                             selected: isSelected,
-                            // ======= 改为浅绿色 =======
                             selectedTileColor: Colors.green.shade50,
                             leading: isDirectory ? const Icon(Icons.folder, color: Colors.amber, size: 40) : null,
                             title: Text(isDirectory ? name : name.replaceAll('.md', ''), style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
                             subtitle: isDirectory ? null : Text(_thumbnails[entity.path] ?? '无内容', maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: Colors.grey)),
                             contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
                             trailing: _isSelectionMode ? Checkbox(
-                              // ======= 改为浅绿色 =======
                               activeColor: Colors.lightGreen,
                               value: isSelected, onChanged: (v) {
                               setState(() {
