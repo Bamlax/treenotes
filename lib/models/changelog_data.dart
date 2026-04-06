@@ -14,8 +14,8 @@ class ChangelogEntry {
 // 把最新的版本写在列表最前面，程序会自动将第一个元素标记为“最新”
 const List<ChangelogEntry> changelogData = [
   ChangelogEntry(
-    version: 'v1.0.0',
-    date: '2026-04-04',
+    version: 'v0.1.0',
+    date: '2026-04-06',
     changes: [
       '初始版本发布。',
       '支持 Markdown 笔记与文件夹的创建、修改和删除。',
