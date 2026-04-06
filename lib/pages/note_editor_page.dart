@@ -1,5 +1,5 @@
 import 'dart:io';
-import 'dart:async'; // 引入 Timer 支持自动保存
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 import '../utils/note_util.dart';
@@ -28,25 +28,41 @@ class NoteEditorPage extends StatefulWidget {
 }
 
 class _NoteEditorPageState extends State<NoteEditorPage> {
+  late File _currentFile; 
   final TextEditingController _bodyController = TextEditingController();
   
+  late TextEditingController _titleController;
+  final FocusNode _titleFocusNode = FocusNode();
+  bool _isEditingTitle = false;
+
   final Map<String, String> _timeProps = {};
   final List<_PropEntry> _customProps = [];
   
   bool _isPreviewMode = false;
   bool _isLoading = true;
 
-  Timer? _autoSaveTimer; // 自动保存的计时器
+  Timer? _autoSaveTimer;
 
   @override
   void initState() {
     super.initState();
+    _currentFile = widget.file;
+    
+    String initialTitle = _currentFile.path.split('/').last.replaceAll('.md', '');
+    _titleController = TextEditingController(text: initialTitle);
+    
+    _titleFocusNode.addListener(() {
+      if (!_titleFocusNode.hasFocus && _isEditingTitle) {
+        _commitRename();
+      }
+    });
+
     _loadFileContent();
   }
 
   Future<void> _loadFileContent() async {
     try {
-      String content = await widget.file.readAsString();
+      String content = await _currentFile.readAsString();
       Map<String, String> parsedProps = NoteUtil.parseFrontmatter(content);
       
       _timeProps['created'] = parsedProps['created'] ?? '';
@@ -61,8 +77,6 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
       });
 
       _bodyController.text = NoteUtil.extractBody(content);
-
-      // 内容加载完成后，添加监听器，每次修改都会触发自动保存
       _bodyController.addListener(_triggerAutoSave);
 
       setState(() => _isLoading = false);
@@ -74,10 +88,8 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
     }
   }
 
-  // ==================== 自动保存机制 ====================
   void _triggerAutoSave() {
     if (_autoSaveTimer?.isActive ?? false) _autoSaveTimer!.cancel();
-    // 停止输入 1 秒后自动静默保存
     _autoSaveTimer = Timer(const Duration(seconds: 1), () {
       _saveFile(silent: true);
     });
@@ -100,9 +112,8 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
       String newFrontmatter = NoteUtil.buildFrontmatter(allProps);
       String newBody = _bodyController.text;
 
-      await widget.file.writeAsString('$newFrontmatter$newBody');
+      await _currentFile.writeAsString('$newFrontmatter$newBody');
 
-      // 只有在非静默模式（或者想手动弹出提示时）才显示 SnackBar
       if (!silent && mounted) {
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('保存成功！'), duration: Duration(seconds: 1)));
       }
@@ -112,10 +123,57 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
       }
     }
   }
-  // ====================================================
+
+  Future<void> _commitRename() async {
+    if (!mounted) return;
+    String currentName = _currentFile.path.split('/').last.replaceAll('.md', '');
+    String newName = _titleController.text.trim();
+
+    if (newName.isEmpty || newName == currentName) {
+      setState(() {
+        _titleController.text = currentName;
+        _isEditingTitle = false;
+      });
+      return;
+    }
+
+    String parentPath = _currentFile.parent.path;
+    String newPath = '$parentPath/$newName.md';
+
+    if (File(newPath).existsSync()) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('该名称已存在！')));
+      setState(() {
+        _titleController.text = currentName;
+        _isEditingTitle = false;
+      });
+      return;
+    }
+
+    try {
+      await _saveFile(silent: true);
+      File renamedFile = await _currentFile.rename(newPath);
+      
+      // ========== 修复：await 之后必须判断 mounted ==========
+      if (!mounted) return; 
+      
+      setState(() {
+        _currentFile = renamedFile;
+        _isEditingTitle = false;
+      });
+    } catch (e) {
+      // ========== 修复：await 之后必须判断 mounted ==========
+      if (!mounted) return; 
+      
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('重命名失败：$e')));
+      setState(() {
+        _titleController.text = currentName;
+        _isEditingTitle = false;
+      });
+    }
+  }
 
   void _showInfoDialog() {
-    int bytes = widget.file.lengthSync();
+    int bytes = _currentFile.lengthSync();
     String sizeStr = bytes < 1024 ? '$bytes B' : bytes < 1024 * 1024 ? '${(bytes / 1024).toStringAsFixed(2)} KB' : '${(bytes / (1024 * 1024)).toStringAsFixed(2)} MB';
     String formatDate(String? dtStr) => (dtStr == null || dtStr.isEmpty) ? '未知 / 尚未同步' : dtStr.split('.')[0]; 
 
@@ -143,39 +201,123 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
     );
   }
 
+  void _insertMarkdown(String prefix, String suffix) {
+    final text = _bodyController.text;
+    final selection = _bodyController.selection;
+    
+    int start = selection.start;
+    int end = selection.end;
+    
+    if (start < 0 || end < 0) {
+      start = text.length;
+      end = text.length;
+    }
+    
+    final selectedText = text.substring(start, end);
+    final newText = text.replaceRange(start, end, '$prefix$selectedText$suffix');
+    
+    _bodyController.value = TextEditingValue(
+      text: newText,
+      selection: TextSelection.collapsed(offset: start + prefix.length + selectedText.length),
+    );
+    
+    _triggerAutoSave();
+  }
+
+  Widget _buildToolbarBtn(IconData icon, String prefix, String suffix, {String tooltip = ''}) {
+    return IconButton(
+      icon: Icon(icon, color: Colors.grey.shade700),
+      tooltip: tooltip,
+      onPressed: () => _insertMarkdown(prefix, suffix),
+    );
+  }
+
+  void _toggleCheckbox(int targetIndex) {
+    final text = _bodyController.text;
+    int currentIdx = 0;
+    
+    final RegExp checkboxPattern = RegExp(r'^([ \t]*[-*+]\s+)\[([ xX])\]', multiLine: true);
+    
+    final newText = text.replaceAllMapped(checkboxPattern, (match) {
+      if (currentIdx == targetIndex) {
+        currentIdx++;
+        String prefix = match.group(1)!;
+        String state = match.group(2)!;
+        String newState = (state == ' ') ? 'x' : ' '; 
+        return '$prefix[$newState]';
+      }
+      currentIdx++;
+      return match.group(0)!;
+    });
+
+    if (text != newText) {
+      _bodyController.text = newText;
+      _triggerAutoSave();
+      setState(() {});
+    }
+  }
+
   @override
   void dispose() {
     _autoSaveTimer?.cancel();
     _bodyController.removeListener(_triggerAutoSave);
-    
-    // 退出页面时，强行做最后一次静默保存
     _saveFile(silent: true);
-    
     _bodyController.dispose();
+    
+    _titleFocusNode.dispose();
+    _titleController.dispose();
+    
     for (var prop in _customProps) { prop.dispose(); }
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    String fileName = widget.file.path.split('/').last.replaceAll('.md', '');
+    int checkboxCounter = 0;
 
     return Scaffold(
       appBar: AppBar(
-        title: Text(fileName, style: const TextStyle(fontSize: 16)),
+        titleSpacing: 0,
         backgroundColor: Theme.of(context).colorScheme.primaryContainer,
+        title: _isEditingTitle
+            ? TextField(
+                controller: _titleController,
+                focusNode: _titleFocusNode,
+                autofocus: true,
+                style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.black87),
+                decoration: const InputDecoration(
+                  border: InputBorder.none,
+                  isDense: true,
+                  hintText: '笔记名称',
+                ),
+                onSubmitted: (_) => _commitRename(),
+              )
+            : GestureDetector(
+                onTap: () {
+                  setState(() {
+                    _isEditingTitle = true;
+                  });
+                },
+                child: Text(
+                  _titleController.text,
+                  style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
         actions: [
           IconButton(
             icon: Icon(_isPreviewMode ? Icons.edit : Icons.preview),
             onPressed: () => setState(() => _isPreviewMode = !(_isPreviewMode)),
           ),
-          // 注意：彻底移除了保存按钮 💾
           PopupMenuButton<String>(
             icon: const Icon(Icons.more_vert),
             onSelected: (value) {
               if (value == 'add_prop') {
-                setState(() => _customProps.add(_PropEntry('', '')));
-                _triggerAutoSave(); // 添加属性框也触发自动保存
+                setState(() {
+                  _isPreviewMode = false; 
+                  _customProps.add(_PropEntry('', ''));
+                });
+                _triggerAutoSave();
               } else if (value == 'info') {
                 _showInfoDialog();
               }
@@ -196,102 +338,191 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
       body: _isLoading
           ? const Center(child: CircularProgressIndicator())
           : _isPreviewMode
-              // ======= 预览模式 =======
-              ? Padding(
-                  padding: const EdgeInsets.all(16.0),
-                  child: Markdown(
-                    data: _bodyController.text, 
-                    selectable: true
-                  ),
-                )
-              // ======= 编辑模式 =======
-              : Padding(
+              // ======================= 阅读模式 =======================
+              ? SingleChildScrollView(
                   padding: const EdgeInsets.all(16.0),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      // ==== 这里彻底移除了原来显示文件名的只读大标题 Text(fileName) ====
-                      
-                      // 自定义属性区域
                       if (_customProps.isNotEmpty)
                         Container(
                           margin: const EdgeInsets.only(bottom: 16),
                           padding: const EdgeInsets.only(left: 12, top: 4, bottom: 4),
-                          decoration: BoxDecoration(
-                            border: Border(left: BorderSide(color: Colors.grey.shade300, width: 3)),
-                          ),
+                          decoration: BoxDecoration(border: Border(left: BorderSide(color: Colors.grey.shade300, width: 3))),
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              ..._customProps.map((prop) {
-                                return Padding(
-                                  padding: const EdgeInsets.symmetric(vertical: 4.0),
-                                  child: Row(
-                                    children: [
-                                      SizedBox(
-                                        width: 80,
-                                        child: TextField(
-                                          controller: prop.keyCtrl,
-                                          onChanged: (v) => _triggerAutoSave(), // 修改属性时触发自动保存
-                                          style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: Colors.grey.shade600),
-                                          decoration: const InputDecoration.collapsed(hintText: '属性名'),
-                                        ),
-                                      ),
-                                      const Text(':  ', style: TextStyle(color: Colors.grey)),
-                                      Expanded(
-                                        child: TextField(
-                                          controller: prop.valCtrl,
-                                          onChanged: (v) => _triggerAutoSave(), // 修改属性时触发自动保存
-                                          style: const TextStyle(fontSize: 14),
-                                          decoration: const InputDecoration.collapsed(hintText: '空'),
-                                        ),
-                                      ),
-                                      InkWell(
-                                        onTap: () {
-                                          setState(() { _customProps.remove(prop); prop.dispose(); });
-                                          _triggerAutoSave(); // 删除属性也触发自动保存
-                                        },
-                                        child: const Icon(Icons.close, size: 16, color: Colors.grey),
-                                      ),
-                                      const SizedBox(width: 8),
-                                    ],
-                                  ),
-                                );
-                              }),
-                              const SizedBox(height: 4),
-                              InkWell(
-                                onTap: () {
-                                  setState(() => _customProps.add(_PropEntry('', '')));
-                                  _triggerAutoSave();
-                                },
-                                child: Padding(
-                                  padding: const EdgeInsets.symmetric(vertical: 4.0),
-                                  child: Row(
-                                    children: [
-                                      Icon(Icons.add, size: 16, color: Colors.grey.shade600),
-                                      const SizedBox(width: 4),
-                                      Text('添加属性', style: TextStyle(fontSize: 13, color: Colors.grey.shade600)),
-                                    ],
-                                  ),
+                            children: _customProps.map((prop) {
+                              if (prop.keyCtrl.text.trim().isEmpty) return const SizedBox.shrink();
+                              return Padding(
+                                padding: const EdgeInsets.symmetric(vertical: 4.0),
+                                child: Row(
+                                  children: [
+                                    SizedBox(
+                                      width: 80,
+                                      child: Text(prop.keyCtrl.text, style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: Colors.grey.shade600)),
+                                    ),
+                                    const Text(':  ', style: TextStyle(color: Colors.grey)),
+                                    Expanded(
+                                      child: Text(prop.valCtrl.text, style: const TextStyle(fontSize: 14)),
+                                    ),
+                                  ],
                                 ),
-                              ),
-                            ],
+                              );
+                            }).toList(),
                           ),
                         ),
 
-                      // 正文区域
-                      Expanded(
-                        child: TextField(
-                          controller: _bodyController,
-                          maxLines: null,
-                          expands: true,
-                          textAlignVertical: TextAlignVertical.top,
-                          decoration: const InputDecoration(border: InputBorder.none, hintText: '开始编写正文...'),
-                          style: const TextStyle(fontSize: 16, height: 1.6),
-                        ),
+                      Builder(
+                        builder: (context) {
+                          String displayData = _bodyController.text.replaceAllMapped(
+                            RegExp(r'^([ \t]*[-*+]\s+\[[ xX]\])\s*$', multiLine: true),
+                            (match) => '${match.group(1)} \u200B',
+                          );
+
+                          return MarkdownBody(
+                            data: displayData, // 使用修复后的文本
+                            selectable: true,
+                            styleSheet: MarkdownStyleSheet(
+                              p: const TextStyle(fontSize: 16, height: 1.6),
+                              listBullet: const TextStyle(fontSize: 16, height: 1.6),
+                            ),
+                            checkboxBuilder: (bool checked) {
+                              int currentIndex = checkboxCounter++;
+                              return InkWell(
+                                onTap: () => _toggleCheckbox(currentIndex),
+                                child: Padding(
+                                  padding: const EdgeInsets.only(right: 6.0),
+                                  child: Icon(
+                                    checked ? Icons.check_box : Icons.check_box_outline_blank,
+                                    size: 20,
+                                    color: checked ? Colors.lightGreen : Colors.grey,
+                                  ),
+                                ),
+                              );
+                            },
+                          );
+                        }
                       ),
                     ],
                   ),
+                )
+              // ======================= 编辑模式 =======================
+              : Column(
+                  children: [
+                    Expanded(
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            if (_customProps.isNotEmpty)
+                              Container(
+                                margin: const EdgeInsets.only(bottom: 16),
+                                padding: const EdgeInsets.only(left: 12, top: 4, bottom: 4),
+                                decoration: BoxDecoration(border: Border(left: BorderSide(color: Colors.grey.shade300, width: 3))),
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    ..._customProps.map((prop) {
+                                      return Padding(
+                                        padding: const EdgeInsets.symmetric(vertical: 4.0),
+                                        child: Row(
+                                          children: [
+                                            SizedBox(
+                                              width: 80,
+                                              child: TextField(
+                                                controller: prop.keyCtrl,
+                                                onChanged: (v) => _triggerAutoSave(),
+                                                style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: Colors.grey.shade600),
+                                                decoration: const InputDecoration.collapsed(hintText: '属性名'),
+                                              ),
+                                            ),
+                                            const Text(':  ', style: TextStyle(color: Colors.grey)),
+                                            Expanded(
+                                              child: TextField(
+                                                controller: prop.valCtrl,
+                                                onChanged: (v) => _triggerAutoSave(),
+                                                style: const TextStyle(fontSize: 14),
+                                                decoration: const InputDecoration.collapsed(hintText: '空'),
+                                              ),
+                                            ),
+                                            InkWell(
+                                              onTap: () {
+                                                setState(() { _customProps.remove(prop); prop.dispose(); });
+                                                _triggerAutoSave();
+                                              },
+                                              child: const Icon(Icons.close, size: 16, color: Colors.grey),
+                                            ),
+                                            const SizedBox(width: 8),
+                                          ],
+                                        ),
+                                      );
+                                    }),
+                                    const SizedBox(height: 4),
+                                    InkWell(
+                                      onTap: () {
+                                        setState(() => _customProps.add(_PropEntry('', '')));
+                                        _triggerAutoSave();
+                                      },
+                                      child: Padding(
+                                        padding: const EdgeInsets.symmetric(vertical: 4.0),
+                                        child: Row(
+                                          children: [
+                                            Icon(Icons.add, size: 16, color: Colors.grey.shade600),
+                                            const SizedBox(width: 4),
+                                            Text('添加属性', style: TextStyle(fontSize: 13, color: Colors.grey.shade600)),
+                                          ],
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+
+                            Expanded(
+                              child: TextField(
+                                controller: _bodyController,
+                                maxLines: null,
+                                expands: true,
+                                textAlignVertical: TextAlignVertical.top,
+                                decoration: const InputDecoration(border: InputBorder.none, hintText: '开始编写正文...'),
+                                style: const TextStyle(fontSize: 16, height: 1.6), 
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    
+                    Container(
+                      height: 48,
+                      width: double.infinity,
+                      decoration: BoxDecoration(
+                        color: Colors.grey.shade100,
+                        border: Border(top: BorderSide(color: Colors.grey.shade300)),
+                      ),
+                      child: SingleChildScrollView(
+                        scrollDirection: Axis.horizontal,
+                        child: Row(
+                          children: [
+                            _buildToolbarBtn(Icons.format_bold, '**', '**', tooltip: '加��'),
+                            _buildToolbarBtn(Icons.format_italic, '*', '*', tooltip: '斜体'),
+                            _buildToolbarBtn(Icons.format_strikethrough, '~~', '~~', tooltip: '删除线'),
+                            _buildToolbarBtn(Icons.format_size, '# ', '', tooltip: '标题'),
+                            _buildToolbarBtn(Icons.format_list_bulleted, '- ', '', tooltip: '无序列表'),
+                            _buildToolbarBtn(Icons.format_list_numbered, '1. ', '', tooltip: '有序列表'),
+                            _buildToolbarBtn(Icons.check_box_outlined, '- [ ] ', '', tooltip: '待办任务'),
+                            _buildToolbarBtn(Icons.format_quote, '> ', '', tooltip: '引用'),
+                            _buildToolbarBtn(Icons.code, '`', '`', tooltip: '行内代码'),
+                            _buildToolbarBtn(Icons.terminal, '```\n', '\n```', tooltip: '代码块'),
+                            _buildToolbarBtn(Icons.link, '[', '](url)', tooltip: '链接'),
+                            _buildToolbarBtn(Icons.image, '![', '](url)', tooltip: '图片'),
+                            _buildToolbarBtn(Icons.functions, r'$$', r'$$', tooltip: '数学公式'),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
                 ),
     );
   }

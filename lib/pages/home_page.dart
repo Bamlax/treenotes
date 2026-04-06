@@ -3,7 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:webdav_client/webdav_client.dart' as webdav;
-import 'package:file_picker/file_picker.dart'; // ==== 引入文件选择器 ====
+import 'package:file_picker/file_picker.dart';
 
 import '../models/sort_method.dart';
 import '../utils/note_util.dart';
@@ -68,7 +68,7 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  // ================= 修改：初始化目录逻辑 =================
+  // ================= 初始化目录逻辑 =================
   Future<void> _initRootDirectory() async {
     final prefs = await SharedPreferences.getInstance();
     String? savedPath = prefs.getString('root_path');
@@ -87,6 +87,7 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _pickRootDirectory() async {
+    // 兼容老版本 file_picker 语法
     String? selectedDirectory = await FilePicker.getDirectoryPath();
 
     if (selectedDirectory != null) {
@@ -283,6 +284,18 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
+  // ==== 遍历本地目录，批量更新同步时间 ====
+  Future<void> _updateAllSyncedTimes(Directory dir) async {
+    try {
+      var entities = dir.listSync(recursive: true);
+      for (var entity in entities) {
+        if (entity is File && entity.path.endsWith('.md')) {
+          await NoteUtil.updateFileSyncedTime(entity);
+        }
+      }
+    } catch (_) {}
+  }
+
   Future<void> _syncCloud() async {
     final prefs = await SharedPreferences.getInstance();
     String davUrl = prefs.getString('dav_url') ?? '';
@@ -290,7 +303,7 @@ class _HomePageState extends State<HomePage> {
     String davPwd = prefs.getString('dav_pwd') ?? '';
 
     if (davUrl.isEmpty || davUser.isEmpty || davPwd.isEmpty) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('请先在设��中配置 WebDAV 账号')));
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('请先在设置中配置 WebDAV 账号')));
       return;
     }
 
@@ -298,8 +311,13 @@ class _HomePageState extends State<HomePage> {
       var client = webdav.newClient(davUrl, user: davUser, password: davPwd);
       await client.ping();
       try { await client.mkdir('/TreeNotes'); } catch (_) {}
+      
       await _uploadDirectory(Directory(_rootPath), '/TreeNotes', client);
       await _downloadDirectory('/TreeNotes', _rootPath, client);
+      
+      // 同步成功后，更新本地所有文件的 synced 时间
+      await _updateAllSyncedTimes(Directory(_rootPath));
+
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('同步成功！')));
         await _loadFiles(_currentPath); 
@@ -309,45 +327,41 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  void _showCreateMenu() {
-    showModalBottomSheet(
-      context: context,
-      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
-      builder: (context) {
-        return SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.symmetric(vertical: 8.0),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                ListTile(
-                  leading: Container(padding: const EdgeInsets.all(8), decoration: BoxDecoration(color: Colors.amber.shade50, borderRadius: BorderRadius.circular(8)), child: const Icon(Icons.folder, color: Colors.amber)),
-                  title: const Text('新建文件夹', style: TextStyle(fontSize: 16)),
-                  onTap: () { Navigator.pop(context); _showNameInputDialog(isFolder: true); },
-                ),
-                ListTile(
-                  leading: Container(padding: const EdgeInsets.all(8), decoration: BoxDecoration(color: Colors.lightGreen.shade50, borderRadius: BorderRadius.circular(8)), child: const Icon(Icons.description, color: Colors.lightGreen)),
-                  title: const Text('新建笔记', style: TextStyle(fontSize: 16)),
-                  onTap: () { Navigator.pop(context); _showNameInputDialog(isFolder: false); },
-                ),
-              ],
-            ),
-          ),
-        );
-      },
-    );
+  // ==================== 极速创建笔记 ====================
+  Future<void> _quickCreateNote() async {
+    int index = 1;
+    String newFileName = '新建$index.md';
+    
+    // 循环查找可用的“新建X”名称
+    while (File('$_currentPath/$newFileName').existsSync()) {
+      index++;
+      newFileName = '新建$index.md';
+    }
+
+    File newFile = File('$_currentPath/$newFileName');
+    await newFile.writeAsString(NoteUtil.generateInitialContent());
+    
+    // 创建完后刷新列表，并直接进入编辑页
+    await _loadFiles(_currentPath);
+    if (mounted) {
+      Navigator.push(
+        context,
+        MaterialPageRoute(builder: (context) => NoteEditorPage(file: newFile)),
+      ).then((_) => _loadFiles(_currentPath));
+    }
   }
 
-  void _showNameInputDialog({required bool isFolder}) {
+  // ==================== 仅保留新建文件夹的弹窗 ====================
+  void _showCreateFolderDialog() {
     TextEditingController controller = TextEditingController();
     showDialog(
       context: context,
       builder: (context) {
         return AlertDialog(
-          title: Text(isFolder ? '新建文件夹' : '新建笔记', style: const TextStyle(fontWeight: FontWeight.bold)),
+          title: const Text('新建文件夹', style: TextStyle(fontWeight: FontWeight.bold)),
           content: TextField(
             controller: controller,
-            decoration: InputDecoration(hintText: isFolder ? '请输入文件夹名称' : '请输入笔记名称 (无需加 .md)', border: const OutlineInputBorder(), contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12)),
+            decoration: const InputDecoration(hintText: '请输入文件夹名称', border: OutlineInputBorder(), contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 12)),
             autofocus: true,
           ),
           actionsPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
@@ -357,18 +371,12 @@ class _HomePageState extends State<HomePage> {
               onPressed: () async {
                 if (controller.text.isNotEmpty) {
                   String name = controller.text.trim();
-                  if (isFolder) {
-                    await Directory('$_currentPath/$name').create();
-                  } else {
-                    if (!name.endsWith('.md')) name += '.md';
-                    File newFile = File('$_currentPath/$name');
-                    await newFile.writeAsString(NoteUtil.generateInitialContent());
-                  }
+                  await Directory('$_currentPath/$name').create();
                   if (context.mounted) Navigator.pop(context);
                   _loadFiles(_currentPath);
                 }
               },
-              style: ElevatedButton.styleFrom(backgroundColor: isFolder ? Colors.amber.shade50 : Colors.lightGreen, foregroundColor: isFolder ? Colors.amber.shade900 : Colors.white, elevation: 0),
+              style: ElevatedButton.styleFrom(backgroundColor: Colors.amber.shade50, foregroundColor: Colors.amber.shade900, elevation: 0),
               child: const Text('确定'),
             ),
           ],
@@ -386,7 +394,7 @@ class _HomePageState extends State<HomePage> {
 
   @override
   Widget build(BuildContext context) {
-    // ================= 修改：如果是首次打开，要求选择目录 =================
+    // 如果是首次打开，要求选择目录
     if (_rootPath.isEmpty) {
       return Scaffold(
         appBar: AppBar(
@@ -399,7 +407,7 @@ class _HomePageState extends State<HomePage> {
             children: [
               const Icon(Icons.folder_special, size: 80, color: Colors.lightGreen),
               const SizedBox(height: 24),
-              const Text('请选择一个本地文件夹\n用来存放你所有的 Markdown 笔记', textAlign: TextAlign.center, style: TextStyle(fontSize: 16, color: Colors.grey)),
+              const Text('请选择一个本地文件夹\n用来存放你所��的 Markdown 笔记', textAlign: TextAlign.center, style: TextStyle(fontSize: 16, color: Colors.grey)),
               const SizedBox(height: 32),
               ElevatedButton.icon(
                 onPressed: _pickRootDirectory,
@@ -416,7 +424,6 @@ class _HomePageState extends State<HomePage> {
         ),
       );
     }
-    // ====================================================================
 
     bool canGoBack = _currentPath != _rootPath;
 
@@ -519,12 +526,16 @@ class _HomePageState extends State<HomePage> {
                         },
                       ),
               ),
+        // ======= 利用 GestureDetector 拦截长按事件 =======
         floatingActionButton: _isSelectionMode 
           ? null 
-          : FloatingActionButton(
-              onPressed: _showCreateMenu,
-              backgroundColor: Theme.of(context).colorScheme.primaryContainer,
-              child: const Icon(Icons.add),
+          : GestureDetector(
+              onLongPress: _showCreateFolderDialog, // 长按弹出新建文件夹
+              child: FloatingActionButton(
+                onPressed: _quickCreateNote, // 短按直接极速创建笔记并打开
+                backgroundColor: Theme.of(context).colorScheme.primaryContainer,
+                child: const Icon(Icons.add),
+              ),
             ),
       ),
     );

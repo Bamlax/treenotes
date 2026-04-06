@@ -1,5 +1,6 @@
+import 'dart:io';
+
 class NoteUtil {
-  // 生成初始内容（去掉了默认的 # $title）
   static String generateInitialContent() {
     String now = DateTime.now().toIso8601String().split('.')[0];
     return '''---
@@ -55,7 +56,6 @@ synced:
     return sb.toString();
   }
 
-  // 提取纯正文
   static String extractBody(String content) {
     if (content.startsWith('---\n') || content.startsWith('---\r\n')) {
       int endIndex = content.indexOf('---', 3);
@@ -73,5 +73,21 @@ synced:
       return DateTime.tryParse(val);
     }
     return null;
+  }
+
+  // ==== 新增：为文件更新同步时间 ====
+  static Future<void> updateFileSyncedTime(File file) async {
+    try {
+      String content = await file.readAsString();
+      Map<String, String> props = parseFrontmatter(content);
+      props['synced'] = DateTime.now().toIso8601String().split('.')[0];
+      
+      String newFrontmatter = buildFrontmatter(props);
+      String body = extractBody(content);
+      
+      await file.writeAsString('$newFrontmatter$body');
+    } catch (e) {
+      // 忽略读取或写入错误
+    }
   }
 }
