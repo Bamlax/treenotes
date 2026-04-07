@@ -32,6 +32,10 @@ class _HomePageState extends State<HomePage> {
   final Set<String> _selectedPaths = {};
   bool get _isSelectionMode => _selectedPaths.isNotEmpty;
 
+  // ==== 新增：同步状态指示 ====
+  bool _isSyncing = false;
+  String _syncMessage = '';
+
   @override
   void initState() {
     super.initState();
@@ -68,28 +72,23 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  // ================= 初始化目录逻辑 =================
   Future<void> _initRootDirectory() async {
     final prefs = await SharedPreferences.getInstance();
     String? savedPath = prefs.getString('root_path');
 
     if (savedPath != null && Directory(savedPath).existsSync()) {
-      // 已经选过目录了，直接加载
       setState(() {
         _rootPath = savedPath;
         _currentPath = savedPath;
       });
       await _loadFiles(_currentPath);
     } else {
-      // 还没选过目录，关闭加载圈，让界面显示选择按钮
       setState(() => _isLoading = false);
     }
   }
 
   Future<void> _pickRootDirectory() async {
-    // 兼容老版本 file_picker 语法
     String? selectedDirectory = await FilePicker.getDirectoryPath();
-
     if (selectedDirectory != null) {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString('root_path', selectedDirectory);
@@ -97,12 +96,11 @@ class _HomePageState extends State<HomePage> {
       setState(() {
         _rootPath = selectedDirectory;
         _currentPath = selectedDirectory;
-        _isLoading = true; // 重新显示加载圈，准备读取文件
+        _isLoading = true; 
       });
       await _loadFiles(_currentPath);
     }
   }
-  // =======================================================
 
   void _sortFiles() {
     _files.sort((a, b) {
@@ -135,6 +133,8 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _loadFiles(String path) async {
     setState(() => _isLoading = true);
+    final prefs = await SharedPreferences.getInstance();
+    bool showYaml = prefs.getBool('show_yaml_in_thumbnail') ?? false;
 
     try {
       Directory dir = Directory(path);
@@ -152,12 +152,26 @@ class _HomePageState extends State<HomePage> {
         if (entity is File) {
           try {
             String content = await entity.readAsString();
+            Map<String, String> props = NoteUtil.parseFrontmatter(content);
+            
             DateTime? created = NoteUtil.getYamlTime(content, 'created');
             DateTime? modified = NoteUtil.getYamlTime(content, 'modified');
             if (created != null) _createdTimes[entity.path] = created;
             if (modified != null) _modifiedTimes[entity.path] = modified;
 
             String textOnly = NoteUtil.extractBody(content).replaceAll('\n', ' ').trim();
+            
+            // ========== 根据设置决定是否将属性拼入缩略图 ==========
+            if (showYaml) {
+              String yamlSummary = '';
+              props.forEach((k, v) {
+                if (k != 'created' && k != 'modified' && k != 'synced' && v.isNotEmpty) {
+                  yamlSummary += '[$k: $v] ';
+                }
+              });
+              textOnly = yamlSummary + textOnly;
+            }
+            
             _thumbnails[entity.path] = textOnly.length > 50 ? '${textOnly.substring(0, 50)}...' : textOnly;
           } catch (e) {
             _thumbnails[entity.path] = "无法读取内容";
@@ -174,35 +188,55 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  void _deleteSelected() {
-    showDialog(
+  void _deleteSelected() async {
+    bool? confirmed = await showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('删除选中项'),
-        content: Text('确定要永久删除选中的 ${_selectedPaths.length} 个项目吗？'),
+        content: Text('确定要永久删除选中的 ${_selectedPaths.length} 个项目吗？（开启云同步时也会从云端删除）'),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
           ElevatedButton(
-            onPressed: () {
-              for (String path in _selectedPaths) {
-                if (FileSystemEntity.isDirectorySync(path)) {
-                  Directory(path).deleteSync(recursive: true);
-                } else {
-                  File(path).deleteSync();
-                }
-              }
-              Navigator.pop(ctx, true);
-            },
+            onPressed: () => Navigator.pop(ctx, true),
             style: ElevatedButton.styleFrom(backgroundColor: Colors.red, foregroundColor: Colors.white),
             child: const Text('删除'),
           ),
         ],
       ),
-    ).then((confirmed) {
-      if (confirmed == true) {
-        _loadFiles(_currentPath);
+    );
+
+    if (confirmed == true) {
+      // ========== 修复：删除本地时，一并尝试删除云端 ==========
+      final prefs = await SharedPreferences.getInstance();
+      String davUrl = prefs.getString('dav_url') ?? '';
+      String davUser = prefs.getString('dav_user') ?? '';
+      String davPwd = prefs.getString('dav_pwd') ?? '';
+      
+      webdav.Client? client;
+      if (davUrl.isNotEmpty && davUser.isNotEmpty && davPwd.isNotEmpty) {
+        client = webdav.newClient(davUrl, user: davUser, password: davPwd);
       }
-    });
+
+      for (String path in _selectedPaths) {
+        String relativePath = path.replaceFirst(_rootPath, '');
+        String remotePath = '/TreeNotes$relativePath';
+
+        if (FileSystemEntity.isDirectorySync(path)) {
+          Directory(path).deleteSync(recursive: true);
+        } else {
+          File(path).deleteSync();
+        }
+        
+        // 尝试从云端删除
+        if (client != null) {
+          try {
+            await client.removeAll(remotePath);
+          } catch (_) {} 
+        }
+      }
+      
+      _loadFiles(_currentPath);
+    }
   }
 
   void _moveSelected() {
@@ -258,6 +292,9 @@ class _HomePageState extends State<HomePage> {
     for (var entity in entities) {
       String name = entity.path.split('/').last;
       String currentRemotePath = '$remotePath/$name';
+      
+      if (mounted) setState(() => _syncMessage = '正在上传: $name');
+
       if (entity is Directory) {
         try { await client.mkdir(currentRemotePath); } catch (_) {} 
         await _uploadDirectory(entity, currentRemotePath, client);
@@ -274,6 +311,9 @@ class _HomePageState extends State<HomePage> {
       String name = file.name ?? '';
       if (name.isEmpty) continue;
       String currentLocalPath = '$localPath/$name';
+
+      if (mounted) setState(() => _syncMessage = '正在下载: $name');
+
       if (file.isDir == true) {
         Directory(currentLocalPath).createSync(recursive: true);
         await _downloadDirectory(file.path!, currentLocalPath, client);
@@ -284,7 +324,6 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  // ==== 遍历本地目录，批量更新同步时间 ====
   Future<void> _updateAllSyncedTimes(Directory dir) async {
     try {
       var entities = dir.listSync(recursive: true);
@@ -307,6 +346,8 @@ class _HomePageState extends State<HomePage> {
       return;
     }
 
+    if (mounted) setState(() { _isSyncing = true; _syncMessage = '连接服务器...'; });
+
     try {
       var client = webdav.newClient(davUrl, user: davUser, password: davPwd);
       await client.ping();
@@ -314,8 +355,6 @@ class _HomePageState extends State<HomePage> {
       
       await _uploadDirectory(Directory(_rootPath), '/TreeNotes', client);
       await _downloadDirectory('/TreeNotes', _rootPath, client);
-      
-      // 同步成功后，更新本地所有文件的 synced 时间
       await _updateAllSyncedTimes(Directory(_rootPath));
 
       if (mounted) {
@@ -324,15 +363,15 @@ class _HomePageState extends State<HomePage> {
       }
     } catch (e) {
       if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('同步失败: $e')));
+    } finally {
+      if (mounted) setState(() { _isSyncing = false; _syncMessage = ''; });
     }
   }
 
-  // ==================== 极速创建笔记 ====================
   Future<void> _quickCreateNote() async {
     int index = 1;
     String newFileName = '新建$index.md';
     
-    // 循环查找可用的“新建X”名称
     while (File('$_currentPath/$newFileName').existsSync()) {
       index++;
       newFileName = '新建$index.md';
@@ -341,7 +380,6 @@ class _HomePageState extends State<HomePage> {
     File newFile = File('$_currentPath/$newFileName');
     await newFile.writeAsString(NoteUtil.generateInitialContent());
     
-    // 创建完后刷新列表，并直接进入编辑页
     await _loadFiles(_currentPath);
     if (mounted) {
       Navigator.push(
@@ -351,7 +389,6 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  // ==================== 仅保留新建文件夹的弹窗 ====================
   void _showCreateFolderDialog() {
     TextEditingController controller = TextEditingController();
     showDialog(
@@ -394,7 +431,6 @@ class _HomePageState extends State<HomePage> {
 
   @override
   Widget build(BuildContext context) {
-    // 如果是首次打开，要求选择目录
     if (_rootPath.isEmpty) {
       return Scaffold(
         appBar: AppBar(
@@ -407,7 +443,7 @@ class _HomePageState extends State<HomePage> {
             children: [
               const Icon(Icons.folder_special, size: 80, color: Colors.lightGreen),
               const SizedBox(height: 24),
-              const Text('请选择一个本地文件夹\n用来存放你所��的 Markdown 笔记', textAlign: TextAlign.center, style: TextStyle(fontSize: 16, color: Colors.grey)),
+              const Text('请选择一个本地文件夹\n用来存放你所有的 Markdown 笔记', textAlign: TextAlign.center, style: TextStyle(fontSize: 16, color: Colors.grey)),
               const SizedBox(height: 32),
               ElevatedButton.icon(
                 onPressed: _pickRootDirectory,
@@ -467,72 +503,90 @@ class _HomePageState extends State<HomePage> {
                 IconButton(
                   icon: const Icon(Icons.settings),
                   tooltip: '设置',
-                  onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (context) => SettingsPage(onSync: _syncCloud))),
+                  onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (context) => SettingsPage(onSync: _syncCloud))).then((_) => _loadFiles(_currentPath)),
                 ),
               ],
         ),
-        body: _isLoading
-            ? const Center(child: CircularProgressIndicator())
-            : RefreshIndicator(
-                onRefresh: _syncCloud,
-                child: _files.isEmpty
-                    ? ListView(
-                        physics: const AlwaysScrollableScrollPhysics(),
-                        children: const [SizedBox(height: 200), Center(child: Text('这里空空如也，向下拉动可同步，或点击右下角新建！'))],
-                      )
-                    : ListView.builder(
-                        physics: const AlwaysScrollableScrollPhysics(),
-                        itemCount: _files.length,
-                        itemBuilder: (context, index) {
-                          FileSystemEntity entity = _files[index];
-                          bool isDirectory = entity is Directory;
-                          String name = entity.path.split('/').last;
-                          bool isSelected = _selectedPaths.contains(entity.path);
+        body: Column(
+          children: [
+            Expanded(
+              child: _isLoading
+                  ? const Center(child: CircularProgressIndicator())
+                  : RefreshIndicator(
+                      onRefresh: _syncCloud,
+                      child: _files.isEmpty
+                          ? ListView(
+                              physics: const AlwaysScrollableScrollPhysics(),
+                              children: const [SizedBox(height: 200), Center(child: Text('这里空空如也，向下拉动可同步，或点击右下角新建！'))],
+                            )
+                          : ListView.builder(
+                              physics: const AlwaysScrollableScrollPhysics(),
+                              itemCount: _files.length,
+                              itemBuilder: (context, index) {
+                                FileSystemEntity entity = _files[index];
+                                bool isDirectory = entity is Directory;
+                                String name = entity.path.split('/').last;
+                                bool isSelected = _selectedPaths.contains(entity.path);
 
-                          return ListTile(
-                            selected: isSelected,
-                            selectedTileColor: Colors.green.shade50,
-                            leading: isDirectory ? const Icon(Icons.folder, color: Colors.amber, size: 40) : null,
-                            title: Text(isDirectory ? name : name.replaceAll('.md', ''), style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-                            subtitle: isDirectory ? null : Text(_thumbnails[entity.path] ?? '无内容', maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: Colors.grey)),
-                            contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-                            trailing: _isSelectionMode ? Checkbox(
-                              activeColor: Colors.lightGreen,
-                              value: isSelected, onChanged: (v) {
-                              setState(() {
-                                if (v == true) _selectedPaths.add(entity.path);
-                                else _selectedPaths.remove(entity.path);
-                              });
-                            }) : null,
-                            onLongPress: () {
-                              setState(() => _selectedPaths.add(entity.path));
-                            },
-                            onTap: () {
-                              if (_isSelectionMode) {
-                                setState(() {
-                                  if (isSelected) _selectedPaths.remove(entity.path);
-                                  else _selectedPaths.add(entity.path);
-                                });
-                              } else {
-                                if (isDirectory) {
-                                  setState(() => _currentPath = entity.path);
-                                  _loadFiles(_currentPath);
-                                } else {
-                                  Navigator.push(context, MaterialPageRoute(builder: (context) => NoteEditorPage(file: entity as File))).then((_) => _loadFiles(_currentPath));
-                                }
-                              }
-                            },
-                          );
-                        },
-                      ),
+                                return ListTile(
+                                  selected: isSelected,
+                                  selectedTileColor: Colors.green.shade50,
+                                  leading: isDirectory ? const Icon(Icons.folder, color: Colors.amber, size: 40) : null,
+                                  title: Text(isDirectory ? name : name.replaceAll('.md', ''), style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                                  subtitle: isDirectory ? null : Text(_thumbnails[entity.path] ?? '无内容', maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: Colors.grey)),
+                                  contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                                  trailing: _isSelectionMode ? Checkbox(
+                                    activeColor: Colors.lightGreen,
+                                    value: isSelected, onChanged: (v) {
+                                    setState(() {
+                                      if (v == true) _selectedPaths.add(entity.path);
+                                      else _selectedPaths.remove(entity.path);
+                                    });
+                                  }) : null,
+                                  onLongPress: () {
+                                    setState(() => _selectedPaths.add(entity.path));
+                                  },
+                                  onTap: () {
+                                    if (_isSelectionMode) {
+                                      setState(() {
+                                        if (isSelected) _selectedPaths.remove(entity.path);
+                                        else _selectedPaths.add(entity.path);
+                                      });
+                                    } else {
+                                      if (isDirectory) {
+                                        setState(() => _currentPath = entity.path);
+                                        _loadFiles(_currentPath);
+                                      } else {
+                                        Navigator.push(context, MaterialPageRoute(builder: (context) => NoteEditorPage(file: entity as File))).then((_) => _loadFiles(_currentPath));
+                                      }
+                                    }
+                                  },
+                                );
+                              },
+                            ),
+                    ),
+            ),
+            // ========== 新增：底部同步状态栏 ==========
+            if (_isSyncing)
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                color: Colors.lightGreen.shade50,
+                child: Row(
+                  children: [
+                    const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
+                    const SizedBox(width: 12),
+                    Expanded(child: Text(_syncMessage, style: TextStyle(color: Colors.green.shade800), maxLines: 1, overflow: TextOverflow.ellipsis)),
+                  ],
+                ),
               ),
-        // ======= 利用 GestureDetector 拦截长按事件 =======
+          ],
+        ),
         floatingActionButton: _isSelectionMode 
           ? null 
           : GestureDetector(
-              onLongPress: _showCreateFolderDialog, // 长按弹出新建文件夹
+              onLongPress: _showCreateFolderDialog, 
               child: FloatingActionButton(
-                onPressed: _quickCreateNote, // 短按直接极速创建笔记并打开
+                onPressed: _quickCreateNote, 
                 backgroundColor: Theme.of(context).colorScheme.primaryContainer,
                 child: const Icon(Icons.add),
               ),

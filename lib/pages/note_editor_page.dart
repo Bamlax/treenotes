@@ -2,6 +2,7 @@ import 'dart:io';
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../utils/note_util.dart';
 
 class _PropEntry {
@@ -57,10 +58,15 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
       }
     });
 
-    _loadFileContent();
+    _loadSettingsAndContent();
   }
 
-  Future<void> _loadFileContent() async {
+  Future<void> _loadSettingsAndContent() async {
+    final prefs = await SharedPreferences.getInstance();
+    setState(() {
+      _isPreviewMode = prefs.getBool('default_is_preview') ?? false;
+    });
+
     try {
       String content = await _currentFile.readAsString();
       Map<String, String> parsedProps = NoteUtil.parseFrontmatter(content);
@@ -152,18 +158,13 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
     try {
       await _saveFile(silent: true);
       File renamedFile = await _currentFile.rename(newPath);
-      
-      // ========== 修复：await 之后必须判断 mounted ==========
       if (!mounted) return; 
-      
       setState(() {
         _currentFile = renamedFile;
         _isEditingTitle = false;
       });
     } catch (e) {
-      // ========== 修复：await 之后必须判断 mounted ==========
       if (!mounted) return; 
-      
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('重命名失败：$e')));
       setState(() {
         _titleController.text = currentName;
@@ -285,24 +286,12 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
                 focusNode: _titleFocusNode,
                 autofocus: true,
                 style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.black87),
-                decoration: const InputDecoration(
-                  border: InputBorder.none,
-                  isDense: true,
-                  hintText: '笔记名称',
-                ),
+                decoration: const InputDecoration(border: InputBorder.none, isDense: true, hintText: '笔记名称'),
                 onSubmitted: (_) => _commitRename(),
               )
             : GestureDetector(
-                onTap: () {
-                  setState(() {
-                    _isEditingTitle = true;
-                  });
-                },
-                child: Text(
-                  _titleController.text,
-                  style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-                  overflow: TextOverflow.ellipsis,
-                ),
+                onTap: () => setState(() => _isEditingTitle = true),
+                child: Text(_titleController.text, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold), overflow: TextOverflow.ellipsis),
               ),
         actions: [
           IconButton(
@@ -323,14 +312,8 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
               }
             },
             itemBuilder: (context) => [
-              const PopupMenuItem<String>(
-                value: 'add_prop',
-                child: Row(children: [Icon(Icons.add_box_outlined, size: 20, color: Colors.grey), SizedBox(width: 8), Text('添加属性')]),
-              ),
-              const PopupMenuItem<String>(
-                value: 'info',
-                child: Row(children: [Icon(Icons.info_outline, size: 20, color: Colors.grey), SizedBox(width: 8), Text('详细信息')]),
-              ),
+              const PopupMenuItem<String>(value: 'add_prop', child: Row(children: [Icon(Icons.add_box_outlined, size: 20, color: Colors.grey), SizedBox(width: 8), Text('添加属性')])),
+              const PopupMenuItem<String>(value: 'info', child: Row(children: [Icon(Icons.info_outline, size: 20, color: Colors.grey), SizedBox(width: 8), Text('详细信息')])),
             ],
           ),
         ],
@@ -357,14 +340,9 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
                                 padding: const EdgeInsets.symmetric(vertical: 4.0),
                                 child: Row(
                                   children: [
-                                    SizedBox(
-                                      width: 80,
-                                      child: Text(prop.keyCtrl.text, style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: Colors.grey.shade600)),
-                                    ),
+                                    SizedBox(width: 80, child: Text(prop.keyCtrl.text, style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: Colors.grey.shade600))),
                                     const Text(':  ', style: TextStyle(color: Colors.grey)),
-                                    Expanded(
-                                      child: Text(prop.valCtrl.text, style: const TextStyle(fontSize: 14)),
-                                    ),
+                                    Expanded(child: Text(prop.valCtrl.text, style: const TextStyle(fontSize: 14))),
                                   ],
                                 ),
                               );
@@ -380,22 +358,29 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
                           );
 
                           return MarkdownBody(
-                            data: displayData, // 使用修复后的文本
+                            data: displayData, 
                             selectable: true,
+                            softLineBreak: true, 
                             styleSheet: MarkdownStyleSheet(
                               p: const TextStyle(fontSize: 16, height: 1.6),
                               listBullet: const TextStyle(fontSize: 16, height: 1.6),
+                              listIndent: 20, // ========== 修复：缩小缩进宽度 ==========
+                              blockSpacing: 10.0,
                             ),
                             checkboxBuilder: (bool checked) {
                               int currentIndex = checkboxCounter++;
                               return InkWell(
                                 onTap: () => _toggleCheckbox(currentIndex),
-                                child: Padding(
-                                  padding: const EdgeInsets.only(right: 6.0),
-                                  child: Icon(
-                                    checked ? Icons.check_box : Icons.check_box_outline_blank,
-                                    size: 20,
-                                    color: checked ? Colors.lightGreen : Colors.grey,
+                                // ========== 修复：利用 Transform 向下平移，完美对齐基线 ==========
+                                child: Transform.translate(
+                                  offset: const Offset(0, 3.5), 
+                                  child: Padding(
+                                    padding: const EdgeInsets.only(right: 6.0),
+                                    child: Icon(
+                                      checked ? Icons.check_box : Icons.check_box_outline_blank,
+                                      size: 20,
+                                      color: checked ? Colors.lightGreen : Colors.grey,
+                                    ),
                                   ),
                                 ),
                               );
@@ -428,31 +413,10 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
                                         padding: const EdgeInsets.symmetric(vertical: 4.0),
                                         child: Row(
                                           children: [
-                                            SizedBox(
-                                              width: 80,
-                                              child: TextField(
-                                                controller: prop.keyCtrl,
-                                                onChanged: (v) => _triggerAutoSave(),
-                                                style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: Colors.grey.shade600),
-                                                decoration: const InputDecoration.collapsed(hintText: '属性名'),
-                                              ),
-                                            ),
+                                            SizedBox(width: 80, child: TextField(controller: prop.keyCtrl, onChanged: (v) => _triggerAutoSave(), style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: Colors.grey.shade600), decoration: const InputDecoration.collapsed(hintText: '属性名'))),
                                             const Text(':  ', style: TextStyle(color: Colors.grey)),
-                                            Expanded(
-                                              child: TextField(
-                                                controller: prop.valCtrl,
-                                                onChanged: (v) => _triggerAutoSave(),
-                                                style: const TextStyle(fontSize: 14),
-                                                decoration: const InputDecoration.collapsed(hintText: '空'),
-                                              ),
-                                            ),
-                                            InkWell(
-                                              onTap: () {
-                                                setState(() { _customProps.remove(prop); prop.dispose(); });
-                                                _triggerAutoSave();
-                                              },
-                                              child: const Icon(Icons.close, size: 16, color: Colors.grey),
-                                            ),
+                                            Expanded(child: TextField(controller: prop.valCtrl, onChanged: (v) => _triggerAutoSave(), style: const TextStyle(fontSize: 14), decoration: const InputDecoration.collapsed(hintText: '空'))),
+                                            InkWell(onTap: () { setState(() { _customProps.remove(prop); prop.dispose(); }); _triggerAutoSave(); }, child: const Icon(Icons.close, size: 16, color: Colors.grey)),
                                             const SizedBox(width: 8),
                                           ],
                                         ),
@@ -460,10 +424,7 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
                                     }),
                                     const SizedBox(height: 4),
                                     InkWell(
-                                      onTap: () {
-                                        setState(() => _customProps.add(_PropEntry('', '')));
-                                        _triggerAutoSave();
-                                      },
+                                      onTap: () { setState(() => _customProps.add(_PropEntry('', ''))); _triggerAutoSave(); },
                                       child: Padding(
                                         padding: const EdgeInsets.symmetric(vertical: 4.0),
                                         child: Row(
@@ -497,15 +458,12 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
                     Container(
                       height: 48,
                       width: double.infinity,
-                      decoration: BoxDecoration(
-                        color: Colors.grey.shade100,
-                        border: Border(top: BorderSide(color: Colors.grey.shade300)),
-                      ),
+                      decoration: BoxDecoration(color: Colors.grey.shade100, border: Border(top: BorderSide(color: Colors.grey.shade300))),
                       child: SingleChildScrollView(
                         scrollDirection: Axis.horizontal,
                         child: Row(
                           children: [
-                            _buildToolbarBtn(Icons.format_bold, '**', '**', tooltip: '加��'),
+                            _buildToolbarBtn(Icons.format_bold, '**', '**', tooltip: '加粗'),
                             _buildToolbarBtn(Icons.format_italic, '*', '*', tooltip: '斜体'),
                             _buildToolbarBtn(Icons.format_strikethrough, '~~', '~~', tooltip: '删除线'),
                             _buildToolbarBtn(Icons.format_size, '# ', '', tooltip: '标题'),
