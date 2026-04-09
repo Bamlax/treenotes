@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:async'; 
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -22,6 +23,15 @@ class _HomePageState extends State<HomePage> {
   String _currentPath = '';
   List<FileSystemEntity> _files = [];
   
+  bool _isSearching = false;
+  bool _isSearchingLoading = false;
+  List<FileSystemEntity> _searchResults = [];
+  final TextEditingController _searchController = TextEditingController();
+  Timer? _searchDebounce;
+  
+  // 新增：专用于搜索时展示的上下文缩略图
+  Map<String, String> _searchThumbnails = {}; 
+
   Map<String, String> _thumbnails = {};
   Map<String, DateTime> _createdTimes = {};
   Map<String, DateTime> _modifiedTimes = {};
@@ -32,9 +42,10 @@ class _HomePageState extends State<HomePage> {
   final Set<String> _selectedPaths = {};
   bool get _isSelectionMode => _selectedPaths.isNotEmpty;
 
-  // ==== 新增：同步状态指示 ====
   bool _isSyncing = false;
   String _syncMessage = '';
+  
+  bool _isGoingBack = false;
 
   @override
   void initState() {
@@ -102,8 +113,8 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  void _sortFiles() {
-    _files.sort((a, b) {
+  void _sortFileArray(List<FileSystemEntity> list) {
+    list.sort((a, b) {
       bool aIsDir = a is Directory;
       bool bIsDir = b is Directory;
 
@@ -128,6 +139,11 @@ class _HomePageState extends State<HomePage> {
           return _currentSort == SortMethod.modifiedDesc ? bTime.compareTo(aTime) : aTime.compareTo(bTime);
       }
     });
+  }
+
+  void _sortFiles() {
+    _sortFileArray(_files);
+    _sortFileArray(_searchResults);
     setState(() {});
   }
 
@@ -161,7 +177,6 @@ class _HomePageState extends State<HomePage> {
 
             String textOnly = NoteUtil.extractBody(content).replaceAll('\n', ' ').trim();
             
-            // ========== 根据设置决定是否将属性拼入缩略图 ==========
             if (showYaml) {
               String yamlSummary = '';
               props.forEach((k, v) {
@@ -188,6 +203,144 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
+  // ==================== 搜索逻辑：带有智能上下文提取 ====================
+  Future<void> _performSearch(String query) async {
+    if (query.trim().isEmpty) {
+      setState(() {
+        _searchResults = [];
+        _searchThumbnails.clear();
+        _isSearchingLoading = false;
+      });
+      return;
+    }
+    
+    setState(() => _isSearchingLoading = true);
+    
+    final prefs = await SharedPreferences.getInstance();
+    bool showYaml = prefs.getBool('show_yaml_in_thumbnail') ?? false;
+
+    String lowerQuery = query.toLowerCase();
+    List<FileSystemEntity> results = [];
+    _searchThumbnails.clear(); // 清空旧的搜索摘要
+    
+    try {
+      Directory dir = Directory(_rootPath);
+      var allEntities = dir.listSync(recursive: true);
+      
+      for (var entity in allEntities) {
+        if (entity is Directory) {
+          String name = entity.path.split('/').last.toLowerCase();
+          if (name.contains(lowerQuery)) results.add(entity);
+        } else if (entity is File && entity.path.toLowerCase().endsWith('.md')) {
+          String name = entity.path.split('/').last.toLowerCase();
+          bool matches = name.contains(lowerQuery); 
+          
+          String content = '';
+          try { content = await entity.readAsString(); } catch (_) {}
+
+          if (!matches && content.toLowerCase().contains(lowerQuery)) {
+            matches = true;
+          }
+          
+          if (matches) {
+            results.add(entity);
+            try {
+              Map<String, String> props = NoteUtil.parseFrontmatter(content);
+              DateTime? created = NoteUtil.getYamlTime(content, 'created');
+              DateTime? modified = NoteUtil.getYamlTime(content, 'modified');
+              if (created != null) _createdTimes[entity.path] = created;
+              if (modified != null) _modifiedTimes[entity.path] = modified;
+
+              String textOnly = NoteUtil.extractBody(content).replaceAll('\n', ' ').trim();
+              String displaySnippet = textOnly;
+              
+              // 智能提取匹配词的上下文
+              int matchIdx = textOnly.toLowerCase().indexOf(lowerQuery);
+              if (matchIdx != -1) {
+                int start = (matchIdx - 15).clamp(0, textOnly.length);
+                int end = (matchIdx + lowerQuery.length + 20).clamp(0, textOnly.length);
+                displaySnippet = (start > 0 ? '...' : '') + textOnly.substring(start, end) + (end < textOnly.length ? '...' : '');
+              } else {
+                displaySnippet = textOnly.length > 50 ? '${textOnly.substring(0, 50)}...' : textOnly;
+              }
+              
+              if (showYaml) {
+                String yamlSummary = '';
+                props.forEach((k, v) {
+                  if (k != 'created' && k != 'modified' && k != 'synced' && v.isNotEmpty) {
+                    yamlSummary += '[$k: $v] ';
+                  }
+                });
+                displaySnippet = yamlSummary + displaySnippet;
+              }
+              
+              _searchThumbnails[entity.path] = displaySnippet;
+            } catch (_) {}
+          }
+        }
+      }
+    } catch (_) {}
+
+    if (mounted && _searchController.text == query) {
+      _sortFileArray(results);
+      setState(() {
+        _searchResults = results;
+        _isSearchingLoading = false;
+      });
+    }
+  }
+
+  void _cancelSearch() {
+    setState(() {
+      _isSearching = false;
+      _searchController.clear();
+      _searchResults.clear();
+      _searchThumbnails.clear();
+    });
+  }
+
+  // ==================== 核心：渲染带高亮背景的文字 ====================
+    Widget _buildHighlightedText(String text, String query, {TextStyle? style, int? maxLines, TextOverflow? overflow}) {
+    if (query.isEmpty) return Text(text, style: style, maxLines: maxLines, overflow: overflow);
+    
+    final lowerText = text.toLowerCase();
+    final lowerQuery = query.toLowerCase();
+    if (!lowerText.contains(lowerQuery)) return Text(text, style: style, maxLines: maxLines, overflow: overflow);
+
+    final List<TextSpan> spans = [];
+    int start = 0;
+    int indexOfMatch;
+
+    while ((indexOfMatch = lowerText.indexOf(lowerQuery, start)) != -1) {
+      if (indexOfMatch > start) {
+        spans.add(TextSpan(text: text.substring(start, indexOfMatch), style: style));
+      }
+      spans.add(TextSpan(
+        text: text.substring(indexOfMatch, indexOfMatch + query.length),
+        style: style?.copyWith(
+          backgroundColor: Colors.yellow.shade300, 
+          color: Colors.black87,
+        ) ?? TextStyle(
+          backgroundColor: Colors.yellow.shade300, 
+          color: Colors.black87,
+        ),
+      ));
+      start = indexOfMatch + query.length;
+    }
+
+    if (start < text.length) {
+      spans.add(TextSpan(text: text.substring(start), style: style));
+    }
+
+    // ========== 修复：改用 Text.rich，它会自动继承系统默认的字体颜色 ==========
+    return Text.rich(
+      TextSpan(children: spans, style: style), 
+      maxLines: maxLines,
+      overflow: overflow ?? TextOverflow.ellipsis,
+    );
+  }
+  // ====================================================================
+
   void _deleteSelected() async {
     bool? confirmed = await showDialog(
       context: context,
@@ -206,7 +359,6 @@ class _HomePageState extends State<HomePage> {
     );
 
     if (confirmed == true) {
-      // ========== 修复：删除本地时，一并尝试删除云端 ==========
       final prefs = await SharedPreferences.getInstance();
       String davUrl = prefs.getString('dav_url') ?? '';
       String davUser = prefs.getString('dav_user') ?? '';
@@ -227,15 +379,12 @@ class _HomePageState extends State<HomePage> {
           File(path).deleteSync();
         }
         
-        // 尝试从云端删除
         if (client != null) {
-          try {
-            await client.removeAll(remotePath);
-          } catch (_) {} 
+          try { await client.removeAll(remotePath); } catch (_) {} 
         }
       }
-      
       _loadFiles(_currentPath);
+      if (_isSearching) _performSearch(_searchController.text);
     }
   }
 
@@ -283,6 +432,7 @@ class _HomePageState extends State<HomePage> {
           }
         }
         _loadFiles(_currentPath);
+        if (_isSearching) _performSearch(_searchController.text);
       }
     });
   }
@@ -292,15 +442,29 @@ class _HomePageState extends State<HomePage> {
     for (var entity in entities) {
       String name = entity.path.split('/').last;
       String currentRemotePath = '$remotePath/$name';
-      
-      if (mounted) setState(() => _syncMessage = '正在上传: $name');
 
       if (entity is Directory) {
         try { await client.mkdir(currentRemotePath); } catch (_) {} 
         await _uploadDirectory(entity, currentRemotePath, client);
       } else if (entity is File && name.endsWith('.md')) {
-        var data = await entity.readAsBytes();
-        await client.write(currentRemotePath, data);
+        bool needsUpload = true;
+        try {
+          String content = await entity.readAsString();
+          DateTime? modified = NoteUtil.getYamlTime(content, 'modified');
+          DateTime? synced = NoteUtil.getYamlTime(content, 'synced');
+          
+          if (modified != null && synced != null) {
+            if (!modified.isAfter(synced)) {
+              needsUpload = false; 
+            }
+          }
+        } catch (_) {}
+
+        if (needsUpload) {
+          if (mounted) setState(() => _syncMessage = '正在上传: $name');
+          var data = await entity.readAsBytes();
+          await client.write(currentRemotePath, data);
+        }
       }
     }
   }
@@ -312,14 +476,32 @@ class _HomePageState extends State<HomePage> {
       if (name.isEmpty) continue;
       String currentLocalPath = '$localPath/$name';
 
-      if (mounted) setState(() => _syncMessage = '正在下载: $name');
-
       if (file.isDir == true) {
         Directory(currentLocalPath).createSync(recursive: true);
         await _downloadDirectory(file.path!, currentLocalPath, client);
       } else if (name.endsWith('.md')) {
-        var data = await client.read(file.path!);
-        await File(currentLocalPath).writeAsBytes(data);
+        bool needsDownload = true;
+        File localFile = File(currentLocalPath);
+        
+        if (localFile.existsSync()) {
+          try {
+            String content = await localFile.readAsString();
+            DateTime? synced = NoteUtil.getYamlTime(content, 'synced');
+            DateTime? remoteTime = file.mTime;
+            
+            if (remoteTime != null && synced != null) {
+              if (remoteTime.difference(synced).inSeconds <= 60) {
+                needsDownload = false;
+              }
+            }
+          } catch (_) {}
+        }
+
+        if (needsDownload) {
+          if (mounted) setState(() => _syncMessage = '正在下载: $name');
+          var data = await client.read(file.path!);
+          await localFile.writeAsBytes(data);
+        }
       }
     }
   }
@@ -358,7 +540,7 @@ class _HomePageState extends State<HomePage> {
       await _updateAllSyncedTimes(Directory(_rootPath));
 
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('同步成功！')));
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('同步完成！')));
         await _loadFiles(_currentPath); 
       }
     } catch (e) {
@@ -385,7 +567,10 @@ class _HomePageState extends State<HomePage> {
       Navigator.push(
         context,
         MaterialPageRoute(builder: (context) => NoteEditorPage(file: newFile)),
-      ).then((_) => _loadFiles(_currentPath));
+      ).then((_) {
+        _loadFiles(_currentPath);
+        if (_isSearching) _performSearch(_searchController.text);
+      });
     }
   }
 
@@ -411,9 +596,10 @@ class _HomePageState extends State<HomePage> {
                   await Directory('$_currentPath/$name').create();
                   if (context.mounted) Navigator.pop(context);
                   _loadFiles(_currentPath);
+                  if (_isSearching) _performSearch(_searchController.text);
                 }
               },
-              style: ElevatedButton.styleFrom(backgroundColor: Colors.amber.shade50, foregroundColor: Colors.amber.shade900, elevation: 0),
+              style: ElevatedButton.styleFrom(backgroundColor: Colors.lightGreen.shade50, foregroundColor: Colors.green.shade800, elevation: 0),
               child: const Text('确定'),
             ),
           ],
@@ -424,9 +610,19 @@ class _HomePageState extends State<HomePage> {
 
   void _goBack() {
     if (_currentPath != _rootPath) {
-      setState(() => _currentPath = Directory(_currentPath).parent.path);
+      setState(() {
+        _isGoingBack = true; 
+        _currentPath = Directory(_currentPath).parent.path;
+      });
       _loadFiles(_currentPath);
     }
+  }
+
+  @override
+  void dispose() {
+    _searchDebounce?.cancel();
+    _searchController.dispose();
+    super.dispose();
   }
 
   @override
@@ -462,13 +658,16 @@ class _HomePageState extends State<HomePage> {
     }
 
     bool canGoBack = _currentPath != _rootPath;
+    List<FileSystemEntity> currentList = _isSearching ? _searchResults : _files;
 
     return PopScope(
-      canPop: !canGoBack && !_isSelectionMode,
+      canPop: !canGoBack && !_isSelectionMode && !_isSearching,
       onPopInvokedWithResult: (didPop, result) {
         if (!didPop) {
           if (_isSelectionMode) {
             setState(() => _selectedPaths.clear()); 
+          } else if (_isSearching) {
+            _cancelSearch();
           } else if (canGoBack) {
             _goBack(); 
           }
@@ -478,95 +677,191 @@ class _HomePageState extends State<HomePage> {
         appBar: AppBar(
           leading: _isSelectionMode
               ? IconButton(icon: const Icon(Icons.close), onPressed: () => setState(() => _selectedPaths.clear()))
-              : (canGoBack ? IconButton(icon: const Icon(Icons.arrow_back), onPressed: _goBack) : null),
-          title: Text(_isSelectionMode ? '已选择 ${_selectedPaths.length} 项' : (canGoBack ? _currentPath.split('/').last : 'TreeNotes')),
+              : (_isSearching 
+                  ? IconButton(icon: const Icon(Icons.arrow_back), onPressed: _cancelSearch)
+                  : (canGoBack ? IconButton(icon: const Icon(Icons.arrow_back), onPressed: _goBack) : null)),
+          title: _isSearching
+              ? TextField(
+                  controller: _searchController,
+                  autofocus: true,
+                  style: const TextStyle(fontSize: 16),
+                  decoration: const InputDecoration(
+                    hintText: '搜索标题、属性或正文...',
+                    border: InputBorder.none,
+                  ),
+                  onChanged: (val) {
+                    if (_searchDebounce?.isActive ?? false) _searchDebounce!.cancel();
+                    _searchDebounce = Timer(const Duration(milliseconds: 500), () {
+                      _performSearch(val);
+                    });
+                  },
+                )
+              : Text(_isSelectionMode ? '已选择 ${_selectedPaths.length} 项' : (canGoBack ? _currentPath.split('/').last : 'TreeNotes')),
           backgroundColor: _isSelectionMode ? Colors.lightGreen.shade100 : Theme.of(context).colorScheme.primaryContainer,
           actions: _isSelectionMode 
             ? [
                 IconButton(icon: const Icon(Icons.drive_file_move, color: Colors.green), tooltip: '移动', onPressed: _moveSelected),
                 IconButton(icon: const Icon(Icons.delete, color: Colors.red), tooltip: '删除', onPressed: _deleteSelected),
               ]
-            : [
-                PopupMenuButton<SortMethod>(
-                  icon: const Icon(Icons.sort),
-                  tooltip: '自定义排序',
-                  onSelected: _saveSortMethod,
-                  itemBuilder: (context) => <PopupMenuEntry<SortMethod>>[
-                    CheckedPopupMenuItem(value: SortMethod.nameAsc, checked: _currentSort == SortMethod.nameAsc, child: const Text('名称 (A-Z)')),
-                    CheckedPopupMenuItem(value: SortMethod.nameDesc, checked: _currentSort == SortMethod.nameDesc, child: const Text('名称 (Z-A)')),
-                    CheckedPopupMenuItem(value: SortMethod.modifiedDesc, checked: _currentSort == SortMethod.modifiedDesc, child: const Text('修改时间 (最新)')),
-                    CheckedPopupMenuItem(value: SortMethod.modifiedAsc, checked: _currentSort == SortMethod.modifiedAsc, child: const Text('修改时间 (最旧)')),
-                    CheckedPopupMenuItem(value: SortMethod.createdDesc, checked: _currentSort == SortMethod.createdDesc, child: const Text('创建时间 (最新)')),
-                    CheckedPopupMenuItem(value: SortMethod.createdAsc, checked: _currentSort == SortMethod.createdAsc, child: const Text('创建时间 (最旧)')),
-                  ],
-                ),
-                IconButton(
-                  icon: const Icon(Icons.settings),
-                  tooltip: '设置',
-                  onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (context) => SettingsPage(onSync: _syncCloud))).then((_) => _loadFiles(_currentPath)),
-                ),
-              ],
+            : (_isSearching
+                ? [
+                    IconButton(
+                      icon: const Icon(Icons.clear),
+                      onPressed: () {
+                        _searchController.clear();
+                        _performSearch('');
+                      },
+                    )
+                  ]
+                : [
+                    IconButton(
+                      icon: const Icon(Icons.search),
+                      tooltip: '搜索',
+                      onPressed: () => setState(() { _isSearching = true; }),
+                    ),
+                    PopupMenuButton<SortMethod>(
+                      icon: const Icon(Icons.sort),
+                      tooltip: '自定义排序',
+                      onSelected: _saveSortMethod,
+                      itemBuilder: (context) => <PopupMenuEntry<SortMethod>>[
+                        CheckedPopupMenuItem(value: SortMethod.nameAsc, checked: _currentSort == SortMethod.nameAsc, child: const Text('名称 (A-Z)')),
+                        CheckedPopupMenuItem(value: SortMethod.nameDesc, checked: _currentSort == SortMethod.nameDesc, child: const Text('名称 (Z-A)')),
+                        CheckedPopupMenuItem(value: SortMethod.modifiedDesc, checked: _currentSort == SortMethod.modifiedDesc, child: const Text('修改时间 (最新)')),
+                        CheckedPopupMenuItem(value: SortMethod.modifiedAsc, checked: _currentSort == SortMethod.modifiedAsc, child: const Text('修改时间 (最旧)')),
+                        CheckedPopupMenuItem(value: SortMethod.createdDesc, checked: _currentSort == SortMethod.createdDesc, child: const Text('创建时间 (最新)')),
+                        CheckedPopupMenuItem(value: SortMethod.createdAsc, checked: _currentSort == SortMethod.createdAsc, child: const Text('创建时间 (最旧)')),
+                      ],
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.settings),
+                      tooltip: '设置',
+                      onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (context) => SettingsPage(onSync: _syncCloud))).then((_) => _loadFiles(_currentPath)),
+                    ),
+                  ]),
         ),
         body: Column(
           children: [
             Expanded(
-              child: _isLoading
-                  ? const Center(child: CircularProgressIndicator())
-                  : RefreshIndicator(
-                      onRefresh: _syncCloud,
-                      child: _files.isEmpty
-                          ? ListView(
-                              physics: const AlwaysScrollableScrollPhysics(),
-                              children: const [SizedBox(height: 200), Center(child: Text('这里空空如也，向下拉动可同步，或点击右下角新建！'))],
-                            )
-                          : ListView.builder(
-                              physics: const AlwaysScrollableScrollPhysics(),
-                              itemCount: _files.length,
-                              itemBuilder: (context, index) {
-                                FileSystemEntity entity = _files[index];
-                                bool isDirectory = entity is Directory;
-                                String name = entity.path.split('/').last;
-                                bool isSelected = _selectedPaths.contains(entity.path);
+              child: (_isSearching && _isSearchingLoading)
+                  ? const Center(key: ValueKey('search_loading'), child: CircularProgressIndicator())
+                  : (!_isSearching && _isLoading)
+                    ? const Center(key: ValueKey('normal_loading'), child: CircularProgressIndicator())
+                    : RefreshIndicator(
+                        onRefresh: _syncCloud,
+                        child: AnimatedSwitcher(
+                          duration: const Duration(milliseconds: 250),
+                          transitionBuilder: (Widget child, Animation<double> animation) {
+                            final inAnimation = Tween<Offset>(
+                              begin: Offset(_isGoingBack ? -1.0 : 1.0, 0.0),
+                              end: Offset.zero,
+                            ).animate(CurvedAnimation(parent: animation, curve: Curves.easeOutCubic));
 
-                                return ListTile(
-                                  selected: isSelected,
-                                  selectedTileColor: Colors.green.shade50,
-                                  leading: isDirectory ? const Icon(Icons.folder, color: Colors.amber, size: 40) : null,
-                                  title: Text(isDirectory ? name : name.replaceAll('.md', ''), style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-                                  subtitle: isDirectory ? null : Text(_thumbnails[entity.path] ?? '无内容', maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: Colors.grey)),
-                                  contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-                                  trailing: _isSelectionMode ? Checkbox(
-                                    activeColor: Colors.lightGreen,
-                                    value: isSelected, onChanged: (v) {
-                                    setState(() {
-                                      if (v == true) _selectedPaths.add(entity.path);
-                                      else _selectedPaths.remove(entity.path);
-                                    });
-                                  }) : null,
-                                  onLongPress: () {
-                                    setState(() => _selectedPaths.add(entity.path));
+                            final outAnimation = Tween<Offset>(
+                              begin: Offset(_isGoingBack ? 1.0 : -1.0, 0.0), 
+                              end: Offset.zero,
+                            ).animate(CurvedAnimation(parent: animation, curve: Curves.easeOutCubic));
+
+                            if (child.key == ValueKey('list_$_currentPath') || child.key == ValueKey('empty_search') || child.key == ValueKey('empty_$_currentPath') || child.key == ValueKey('search_list')) {
+                              return SlideTransition(position: inAnimation, child: child);
+                            } else {
+                              return SlideTransition(position: outAnimation, child: child);
+                            }
+                          },
+                          child: currentList.isEmpty
+                              ? ListView(
+                                  key: ValueKey(_isSearching ? 'empty_search' : 'empty_$_currentPath'),
+                                  physics: const AlwaysScrollableScrollPhysics(),
+                                  children: [
+                                    if (_isSearching)
+                                      Container(
+                                        height: 200,
+                                        alignment: Alignment.center,
+                                        child: Text(
+                                          _searchController.text.trim().isEmpty ? '输入关键字进行全局搜索' : '没有找到相关内容',
+                                          style: const TextStyle(color: Colors.grey),
+                                        ),
+                                      )
+                                  ], 
+                                )
+                              : ListView.builder(
+                                  key: ValueKey(_isSearching ? 'search_list' : 'list_$_currentPath'),
+                                  physics: const AlwaysScrollableScrollPhysics(),
+                                  itemCount: currentList.length,
+                                  itemBuilder: (context, index) {
+                                    FileSystemEntity entity = currentList[index];
+                                    bool isDirectory = entity is Directory;
+                                    String name = entity.path.split('/').last;
+                                    bool isSelected = _selectedPaths.contains(entity.path);
+
+                                    // ========== 应用高亮的文本数据 ==========
+                                    String titleStr = isDirectory ? name : name.replaceAll('.md', '');
+                                    String subtitleStr = _isSearching 
+                                        ? (_searchThumbnails[entity.path] ?? '无内容') 
+                                        : (_thumbnails[entity.path] ?? '无内容');
+                                    String query = _isSearching ? _searchController.text.trim() : '';
+
+                                    return ListTile(
+                                      selected: isSelected,
+                                      selectedTileColor: Colors.green.shade50,
+                                      leading: isDirectory ? const Icon(Icons.folder, color: Colors.amber, size: 40) : null,
+                                      // ================= 使用自定义高亮渲染器 =================
+                                      title: _buildHighlightedText(
+                                        titleStr, 
+                                        query, 
+                                        style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)
+                                      ),
+                                      subtitle: isDirectory 
+                                          ? null 
+                                          : _buildHighlightedText(
+                                              subtitleStr, 
+                                              query, 
+                                              maxLines: 1, 
+                                              overflow: TextOverflow.ellipsis, 
+                                              style: const TextStyle(color: Colors.grey)
+                                            ),
+                                      // ========================================================
+                                      contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                                      trailing: _isSelectionMode ? Checkbox(
+                                        activeColor: Colors.lightGreen,
+                                        value: isSelected, onChanged: (v) {
+                                        setState(() {
+                                          if (v == true) _selectedPaths.add(entity.path);
+                                          else _selectedPaths.remove(entity.path);
+                                        });
+                                      }) : null,
+                                      onLongPress: () {
+                                        setState(() => _selectedPaths.add(entity.path));
+                                      },
+                                      onTap: () {
+                                        if (_isSelectionMode) {
+                                          setState(() {
+                                            if (isSelected) _selectedPaths.remove(entity.path);
+                                            else _selectedPaths.add(entity.path);
+                                          });
+                                        } else {
+                                          if (isDirectory) {
+                                            setState(() {
+                                              _isGoingBack = false; 
+                                              _currentPath = entity.path;
+                                              if (_isSearching) {
+                                                _cancelSearch(); 
+                                              }
+                                            });
+                                            _loadFiles(_currentPath);
+                                          } else {
+                                            Navigator.push(context, MaterialPageRoute(builder: (context) => NoteEditorPage(file: entity as File))).then((_) {
+                                              _loadFiles(_currentPath);
+                                              if (_isSearching) _performSearch(_searchController.text);
+                                            });
+                                          }
+                                        }
+                                      },
+                                    );
                                   },
-                                  onTap: () {
-                                    if (_isSelectionMode) {
-                                      setState(() {
-                                        if (isSelected) _selectedPaths.remove(entity.path);
-                                        else _selectedPaths.add(entity.path);
-                                      });
-                                    } else {
-                                      if (isDirectory) {
-                                        setState(() => _currentPath = entity.path);
-                                        _loadFiles(_currentPath);
-                                      } else {
-                                        Navigator.push(context, MaterialPageRoute(builder: (context) => NoteEditorPage(file: entity as File))).then((_) => _loadFiles(_currentPath));
-                                      }
-                                    }
-                                  },
-                                );
-                              },
-                            ),
-                    ),
+                                ),
+                        ),
+                      ),
             ),
-            // ========== 新增：底部同步状态栏 ==========
             if (_isSyncing)
               Container(
                 padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
@@ -581,7 +876,7 @@ class _HomePageState extends State<HomePage> {
               ),
           ],
         ),
-        floatingActionButton: _isSelectionMode 
+        floatingActionButton: (_isSelectionMode || _isSearching)
           ? null 
           : GestureDetector(
               onLongPress: _showCreateFolderDialog, 

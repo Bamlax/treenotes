@@ -13,7 +13,18 @@ class ChangelogEntry {
 // 专门记录所有版本更新信息的列表
 // 把最新的版本写在列表最前面，程序会自动将第一个元素标记为“最新”
 const List<ChangelogEntry> changelogData = [
-      ChangelogEntry(
+    ChangelogEntry(
+    version: 'v0.5.0',
+    date: '2026-04-07',
+    changes: [
+      '新增文件夹打开动画',
+      '新增搜索功能',
+      '优化同步逻辑',
+      '美化UI',
+      '修复新建文件时按回车报错的bug',
+    ],
+  ),
+    ChangelogEntry(
     version: 'v0.4.0',
     date: '2026-04-07',
     changes: [

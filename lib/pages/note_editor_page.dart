@@ -35,6 +35,7 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
   late TextEditingController _titleController;
   final FocusNode _titleFocusNode = FocusNode();
   bool _isEditingTitle = false;
+  bool _isRenaming = false; // ========== 新增：防止双重触发重命名的锁 ==========
 
   final Map<String, String> _timeProps = {};
   final List<_PropEntry> _customProps = [];
@@ -131,7 +132,9 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
   }
 
   Future<void> _commitRename() async {
-    if (!mounted) return;
+    if (!mounted || _isRenaming) return;
+    _isRenaming = true; // 锁定
+
     String currentName = _currentFile.path.split('/').last.replaceAll('.md', '');
     String newName = _titleController.text.trim();
 
@@ -140,6 +143,7 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
         _titleController.text = currentName;
         _isEditingTitle = false;
       });
+      _isRenaming = false;
       return;
     }
 
@@ -152,6 +156,7 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
         _titleController.text = currentName;
         _isEditingTitle = false;
       });
+      _isRenaming = false;
       return;
     }
 
@@ -170,6 +175,8 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
         _titleController.text = currentName;
         _isEditingTitle = false;
       });
+    } finally {
+      _isRenaming = false; // 解锁
     }
   }
 
@@ -364,14 +371,13 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
                             styleSheet: MarkdownStyleSheet(
                               p: const TextStyle(fontSize: 16, height: 1.6),
                               listBullet: const TextStyle(fontSize: 16, height: 1.6),
-                              listIndent: 20, // ========== 修复：缩小缩进宽度 ==========
+                              listIndent: 20, 
                               blockSpacing: 10.0,
                             ),
                             checkboxBuilder: (bool checked) {
                               int currentIndex = checkboxCounter++;
                               return InkWell(
                                 onTap: () => _toggleCheckbox(currentIndex),
-                                // ========== 修复：利用 Transform 向下平移，完美对齐基线 ==========
                                 child: Transform.translate(
                                   offset: const Offset(0, 3.5), 
                                   child: Padding(
