@@ -14,8 +14,18 @@ class ChangelogEntry {
 // 把最新的版本写在列表最前面，程序会自动将第一个元素标记为“最新”
 const List<ChangelogEntry> changelogData = [
     ChangelogEntry(
+    version: 'v0.6.0',
+    date: '2026-04-10',
+    changes: [
+      '新增双链功能',
+      '新增目录内容的提示',
+      '修复文件夹动画不触发的问题',
+      '更正设置底部版本号的调用逻辑',
+    ],
+  ),
+    ChangelogEntry(
     version: 'v0.5.0',
-    date: '2026-04-07',
+    date: '2026-04-08',
     changes: [
       '新增文件夹打开动画',
       '新增搜索功能',

@@ -35,7 +35,7 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
   late TextEditingController _titleController;
   final FocusNode _titleFocusNode = FocusNode();
   bool _isEditingTitle = false;
-  bool _isRenaming = false; // ========== 新增：防止双重触发重命名的锁 ==========
+  bool _isRenaming = false; 
 
   final Map<String, String> _timeProps = {};
   final List<_PropEntry> _customProps = [];
@@ -133,7 +133,7 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
 
   Future<void> _commitRename() async {
     if (!mounted || _isRenaming) return;
-    _isRenaming = true; // 锁定
+    _isRenaming = true; 
 
     String currentName = _currentFile.path.split('/').last.replaceAll('.md', '');
     String newName = _titleController.text.trim();
@@ -176,7 +176,7 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
         _isEditingTitle = false;
       });
     } finally {
-      _isRenaming = false; // 解锁
+      _isRenaming = false; 
     }
   }
 
@@ -264,6 +264,31 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
       setState(() {});
     }
   }
+
+  // ==================== 新增：处理双向链接跳转 ====================
+  Future<void> _handleWikilinkTap(String noteName) async {
+    String targetPath = '${_currentFile.parent.path}/$noteName.md';
+    File targetFile = File(targetPath);
+
+    // 如果文件不存在，直接创建空笔记
+    if (!targetFile.existsSync()) {
+      await targetFile.writeAsString(NoteUtil.generateInitialContent());
+    }
+
+    if (mounted) {
+      // 保存当前笔记
+      await _saveFile(silent: true);
+      // 跳转到目标笔记
+      Navigator.push(
+        context,
+        MaterialPageRoute(builder: (context) => NoteEditorPage(file: targetFile)),
+      ).then((_) {
+        // 返回时重新加载当前笔记（防止在别处被修改）
+        _loadSettingsAndContent();
+      });
+    }
+  }
+  // ==============================================================
 
   @override
   void dispose() {
@@ -359,9 +384,21 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
 
                       Builder(
                         builder: (context) {
-                          String displayData = _bodyController.text.replaceAllMapped(
+                          String displayData = _bodyController.text;
+
+                          // 1. 修复空待办 Bug
+                          displayData = displayData.replaceAllMapped(
                             RegExp(r'^([ \t]*[-*+]\s+\[[ xX]\])\s*$', multiLine: true),
                             (match) => '${match.group(1)} \u200B',
+                          );
+
+                          // 2. 将 [[双向链接]] 转换为标准 Markdown 链接 [笔记名](wikilink:笔记名)
+                          displayData = displayData.replaceAllMapped(
+                            RegExp(r'\[\[(.*?)\]\]'),
+                            (match) {
+                              String name = match.group(1) ?? '';
+                              return '[$name](wikilink:${Uri.encodeComponent(name)})';
+                            },
                           );
 
                           return MarkdownBody(
@@ -373,7 +410,17 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
                               listBullet: const TextStyle(fontSize: 16, height: 1.6),
                               listIndent: 20, 
                               blockSpacing: 10.0,
+                              // 把双向链接染成不同的颜色以示区分
+                              a: TextStyle(color: Colors.green.shade700, decoration: TextDecoration.underline), 
                             ),
+                            // ==================== 拦截点击事件 ====================
+                            onTapLink: (text, href, title) {
+                              if (href != null && href.startsWith('wikilink:')) {
+                                String noteName = Uri.decodeComponent(href.replaceFirst('wikilink:', ''));
+                                _handleWikilinkTap(noteName);
+                              }
+                            },
+                            // ======================================================
                             checkboxBuilder: (bool checked) {
                               int currentIndex = checkboxCounter++;
                               return InkWell(
@@ -480,6 +527,9 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
                             _buildToolbarBtn(Icons.code, '`', '`', tooltip: '行内代码'),
                             _buildToolbarBtn(Icons.terminal, '```\n', '\n```', tooltip: '代码块'),
                             _buildToolbarBtn(Icons.link, '[', '](url)', tooltip: '链接'),
+                            // ==================== 新增：双链快捷按钮 ====================
+                            _buildToolbarBtn(Icons.cable, '[[', ']]', tooltip: '双向链接'),
+                            // ==========================================================
                             _buildToolbarBtn(Icons.image, '![', '](url)', tooltip: '图片'),
                             _buildToolbarBtn(Icons.functions, r'$$', r'$$', tooltip: '数学公式'),
                           ],

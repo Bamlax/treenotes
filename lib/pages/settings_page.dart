@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:package_info_plus/package_info_plus.dart'; // 引入插件
 import 'webdav_settings_page.dart';
 import 'changelog_page.dart'; 
 import 'about_page.dart'; 
@@ -16,11 +17,15 @@ class SettingsPage extends StatefulWidget {
 class _SettingsPageState extends State<SettingsPage> {
   bool _showYamlInThumbnail = false;
   bool _defaultIsPreview = false;
+  
+  // ================= 新增：存放版本号的变量 =================
+  String _appVersion = ''; 
 
   @override
   void initState() {
     super.initState();
     _loadSettings();
+    _loadAppVersion(); // 初始化时加载版本信息
   }
 
   Future<void> _loadSettings() async {
@@ -30,6 +35,22 @@ class _SettingsPageState extends State<SettingsPage> {
       _defaultIsPreview = prefs.getBool('default_is_preview') ?? false;
     });
   }
+
+  // ================= 新增：异步获取应用版本号 =================
+  Future<void> _loadAppVersion() async {
+    try {
+      PackageInfo packageInfo = await PackageInfo.fromPlatform();
+      setState(() {
+        _appVersion = packageInfo.version; 
+        // 注：如果你想连构建号一起显示，可以写成 '${packageInfo.version}+${packageInfo.buildNumber}'
+      });
+    } catch (e) {
+      setState(() {
+        _appVersion = '1.0.0'; // 如果获取失败，给个默认值兜底
+      });
+    }
+  }
+  // =======================================================
 
   Future<void> _updateYamlSetting(bool value) async {
     final prefs = await SharedPreferences.getInstance();
@@ -52,7 +73,6 @@ class _SettingsPageState extends State<SettingsPage> {
       ),
       body: ListView(
         children: [
-          // ================= 新增：样式设置 =================
           const Padding(
             padding: EdgeInsets.only(left: 16, top: 16, bottom: 8),
             child: Text('偏好设置', style: TextStyle(color: Colors.lightGreen, fontWeight: FontWeight.bold)),
@@ -72,7 +92,6 @@ class _SettingsPageState extends State<SettingsPage> {
             onChanged: _updateYamlSetting,
           ),
           const Divider(),
-          // =================================================
 
           const Padding(
             padding: EdgeInsets.only(left: 16, top: 8, bottom: 8),
@@ -110,12 +129,13 @@ class _SettingsPageState extends State<SettingsPage> {
             },
           ),
 
-          const Padding(
-            padding: EdgeInsets.symmetric(vertical: 32.0),
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 32.0),
             child: Center(
               child: Text(
-                'TreeNotes v1.0.0',
-                style: TextStyle(color: Colors.grey, fontSize: 14),
+                // ================= 动态显示版本号 =================
+                _appVersion.isEmpty ? '加载中...' : 'TreeNotes v$_appVersion',
+                style: const TextStyle(color: Colors.grey, fontSize: 14),
               ),
             ),
           )

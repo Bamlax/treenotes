@@ -21,6 +21,8 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   String _rootPath = '';
   String _currentPath = '';
+  String _renderedPath = ''; 
+  
   List<FileSystemEntity> _files = [];
   
   bool _isSearching = false;
@@ -28,13 +30,15 @@ class _HomePageState extends State<HomePage> {
   List<FileSystemEntity> _searchResults = [];
   final TextEditingController _searchController = TextEditingController();
   Timer? _searchDebounce;
-  
-  // 新增：专用于搜索时展示的上下文缩略图
   Map<String, String> _searchThumbnails = {}; 
 
   Map<String, String> _thumbnails = {};
   Map<String, DateTime> _createdTimes = {};
   Map<String, DateTime> _modifiedTimes = {};
+  
+  // ================= 新增：用于存储每个文件夹内部文件数量的映射 =================
+  Map<String, String> _dirItemCounts = {};
+  // =========================================================================
   
   bool _isLoading = true;
   SortMethod _currentSort = SortMethod.nameAsc;
@@ -91,6 +95,7 @@ class _HomePageState extends State<HomePage> {
       setState(() {
         _rootPath = savedPath;
         _currentPath = savedPath;
+        _renderedPath = savedPath; 
       });
       await _loadFiles(_currentPath);
     } else {
@@ -107,6 +112,7 @@ class _HomePageState extends State<HomePage> {
       setState(() {
         _rootPath = selectedDirectory;
         _currentPath = selectedDirectory;
+        _renderedPath = selectedDirectory;
         _isLoading = true; 
       });
       await _loadFiles(_currentPath);
@@ -147,8 +153,30 @@ class _HomePageState extends State<HomePage> {
     setState(() {});
   }
 
+  // ================= 新增：获取目录内文件和文件夹数量的方法 =================
+  String _getDirCountText(Directory dir) {
+    try {
+      int dCount = 0;
+      int fCount = 0;
+      for (var child in dir.listSync()) {
+        if (child is Directory) {
+          dCount++;
+        } else if (child is File && child.path.toLowerCase().endsWith('.md')) {
+          fCount++;
+        }
+      }
+      List<String> labels = [];
+      if (dCount > 0) labels.add('$dCount 目录');
+      if (fCount > 0) labels.add('$fCount 笔记');
+      return labels.isEmpty ? '空' : labels.join(' · ');
+    } catch (_) {
+      return '';
+    }
+  }
+  // =====================================================================
+
   Future<void> _loadFiles(String path) async {
-    setState(() => _isLoading = true);
+    setState(() => _isLoading = true); 
     final prefs = await SharedPreferences.getInstance();
     bool showYaml = prefs.getBool('show_yaml_in_thumbnail') ?? false;
 
@@ -163,9 +191,13 @@ class _HomePageState extends State<HomePage> {
       _thumbnails.clear();
       _createdTimes.clear();
       _modifiedTimes.clear();
+      _dirItemCounts.clear(); // 清理旧统计
 
       for (var entity in entities) {
-        if (entity is File) {
+        if (entity is Directory) {
+          // ========== 统计文件夹内容 ==========
+          _dirItemCounts[entity.path] = _getDirCountText(entity);
+        } else if (entity is File) {
           try {
             String content = await entity.readAsString();
             Map<String, String> props = NoteUtil.parseFrontmatter(content);
@@ -195,6 +227,7 @@ class _HomePageState extends State<HomePage> {
       }
 
       _files = entities;
+      _renderedPath = path; 
       _selectedPaths.clear(); 
       _sortFiles();
       _isLoading = false;
@@ -203,7 +236,6 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  // ==================== 搜索逻辑：带有智能上下文提取 ====================
   Future<void> _performSearch(String query) async {
     if (query.trim().isEmpty) {
       setState(() {
@@ -221,7 +253,7 @@ class _HomePageState extends State<HomePage> {
 
     String lowerQuery = query.toLowerCase();
     List<FileSystemEntity> results = [];
-    _searchThumbnails.clear(); // 清空旧的搜索摘要
+    _searchThumbnails.clear(); 
     
     try {
       Directory dir = Directory(_rootPath);
@@ -229,6 +261,9 @@ class _HomePageState extends State<HomePage> {
       
       for (var entity in allEntities) {
         if (entity is Directory) {
+          // ========== 搜索时同样预先统计文件夹内容 ==========
+          _dirItemCounts[entity.path] = _getDirCountText(entity);
+          
           String name = entity.path.split('/').last.toLowerCase();
           if (name.contains(lowerQuery)) results.add(entity);
         } else if (entity is File && entity.path.toLowerCase().endsWith('.md')) {
@@ -254,7 +289,6 @@ class _HomePageState extends State<HomePage> {
               String textOnly = NoteUtil.extractBody(content).replaceAll('\n', ' ').trim();
               String displaySnippet = textOnly;
               
-              // 智能提取匹配词的上下文
               int matchIdx = textOnly.toLowerCase().indexOf(lowerQuery);
               if (matchIdx != -1) {
                 int start = (matchIdx - 15).clamp(0, textOnly.length);
@@ -293,14 +327,14 @@ class _HomePageState extends State<HomePage> {
   void _cancelSearch() {
     setState(() {
       _isSearching = false;
+      _isGoingBack = true; 
       _searchController.clear();
       _searchResults.clear();
       _searchThumbnails.clear();
     });
   }
 
-  // ==================== 核心：渲染带高亮背景的文字 ====================
-    Widget _buildHighlightedText(String text, String query, {TextStyle? style, int? maxLines, TextOverflow? overflow}) {
+  Widget _buildHighlightedText(String text, String query, {TextStyle? style, int? maxLines, TextOverflow? overflow}) {
     if (query.isEmpty) return Text(text, style: style, maxLines: maxLines, overflow: overflow);
     
     final lowerText = text.toLowerCase();
@@ -332,14 +366,12 @@ class _HomePageState extends State<HomePage> {
       spans.add(TextSpan(text: text.substring(start), style: style));
     }
 
-    // ========== 修复：改用 Text.rich，它会自动继承系统默认的字体颜色 ==========
     return Text.rich(
       TextSpan(children: spans, style: style), 
       maxLines: maxLines,
       overflow: overflow ?? TextOverflow.ellipsis,
     );
   }
-  // ====================================================================
 
   void _deleteSelected() async {
     bool? confirmed = await showDialog(
@@ -717,7 +749,7 @@ class _HomePageState extends State<HomePage> {
                     IconButton(
                       icon: const Icon(Icons.search),
                       tooltip: '搜索',
-                      onPressed: () => setState(() { _isSearching = true; }),
+                      onPressed: () => setState(() { _isSearching = true; _isGoingBack = false; }), 
                     ),
                     PopupMenuButton<SortMethod>(
                       icon: const Icon(Icons.sort),
@@ -742,125 +774,147 @@ class _HomePageState extends State<HomePage> {
         body: Column(
           children: [
             Expanded(
-              child: (_isSearching && _isSearchingLoading)
-                  ? const Center(key: ValueKey('search_loading'), child: CircularProgressIndicator())
-                  : (!_isSearching && _isLoading)
-                    ? const Center(key: ValueKey('normal_loading'), child: CircularProgressIndicator())
-                    : RefreshIndicator(
-                        onRefresh: _syncCloud,
-                        child: AnimatedSwitcher(
-                          duration: const Duration(milliseconds: 250),
-                          transitionBuilder: (Widget child, Animation<double> animation) {
-                            final inAnimation = Tween<Offset>(
-                              begin: Offset(_isGoingBack ? -1.0 : 1.0, 0.0),
-                              end: Offset.zero,
-                            ).animate(CurvedAnimation(parent: animation, curve: Curves.easeOutCubic));
+              child: Stack(
+                children: [
+                  RefreshIndicator(
+                    onRefresh: _syncCloud,
+                    child: AnimatedSwitcher(
+                      duration: const Duration(milliseconds: 250),
+                      transitionBuilder: (Widget child, Animation<double> animation) {
+                        final Key currentKey = _isSearching 
+                            ? (currentList.isEmpty ? const ValueKey('empty_search') : const ValueKey('search_list'))
+                            : (currentList.isEmpty ? ValueKey('empty_$_renderedPath') : ValueKey('list_$_renderedPath'));
+                            
+                        final bool isEntering = child.key == currentKey;
+                        
+                        Offset beginOffset;
+                        if (_isGoingBack) {
+                          beginOffset = isEntering ? const Offset(-1.0, 0.0) : const Offset(1.0, 0.0);
+                        } else {
+                          beginOffset = isEntering ? const Offset(1.0, 0.0) : const Offset(-1.0, 0.0);
+                        }
 
-                            final outAnimation = Tween<Offset>(
-                              begin: Offset(_isGoingBack ? 1.0 : -1.0, 0.0), 
-                              end: Offset.zero,
-                            ).animate(CurvedAnimation(parent: animation, curve: Curves.easeOutCubic));
+                        final offsetAnimation = Tween<Offset>(
+                          begin: beginOffset,
+                          end: Offset.zero,
+                        ).animate(CurvedAnimation(parent: animation, curve: Curves.easeOutCubic));
 
-                            if (child.key == ValueKey('list_$_currentPath') || child.key == ValueKey('empty_search') || child.key == ValueKey('empty_$_currentPath') || child.key == ValueKey('search_list')) {
-                              return SlideTransition(position: inAnimation, child: child);
-                            } else {
-                              return SlideTransition(position: outAnimation, child: child);
-                            }
-                          },
-                          child: currentList.isEmpty
-                              ? ListView(
-                                  key: ValueKey(_isSearching ? 'empty_search' : 'empty_$_currentPath'),
-                                  physics: const AlwaysScrollableScrollPhysics(),
-                                  children: [
-                                    if (_isSearching)
-                                      Container(
-                                        height: 200,
-                                        alignment: Alignment.center,
-                                        child: Text(
-                                          _searchController.text.trim().isEmpty ? '输入关键字进行全局搜索' : '没有找到相关内容',
-                                          style: const TextStyle(color: Colors.grey),
+                        return SlideTransition(position: offsetAnimation, child: child);
+                      },
+                      child: currentList.isEmpty
+                          ? ListView(
+                              key: ValueKey(_isSearching ? 'empty_search' : 'empty_$_renderedPath'),
+                              physics: const AlwaysScrollableScrollPhysics(),
+                              children: [
+                                if (_isSearching)
+                                  Container(
+                                    height: 200,
+                                    alignment: Alignment.center,
+                                    child: Text(
+                                      _searchController.text.trim().isEmpty ? '输入关键字进行全局搜索' : '没有找到相关内容',
+                                      style: const TextStyle(color: Colors.grey),
+                                    ),
+                                  )
+                              ], 
+                            )
+                          : ListView.builder(
+                              key: ValueKey(_isSearching ? 'search_list' : 'list_$_renderedPath'),
+                              physics: const AlwaysScrollableScrollPhysics(),
+                              itemCount: currentList.length,
+                              itemBuilder: (context, index) {
+                                FileSystemEntity entity = currentList[index];
+                                bool isDirectory = entity is Directory;
+                                String name = entity.path.split('/').last;
+                                bool isSelected = _selectedPaths.contains(entity.path);
+
+                                String titleStr = isDirectory ? name : name.replaceAll('.md', '');
+                                String subtitleStr = _isSearching 
+                                    ? (_searchThumbnails[entity.path] ?? '无内容') 
+                                    : (_thumbnails[entity.path] ?? '无内容');
+                                String query = _isSearching ? _searchController.text.trim() : '';
+
+                                return ListTile(
+                                  selected: isSelected,
+                                  selectedTileColor: Colors.green.shade50,
+                                  leading: isDirectory ? const Icon(Icons.folder, color: Colors.amber, size: 40) : null,
+                                  title: _buildHighlightedText(
+                                    titleStr, 
+                                    query, 
+                                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)
+                                  ),
+                                  subtitle: isDirectory 
+                                      ? null 
+                                      : _buildHighlightedText(
+                                          subtitleStr, 
+                                          query, 
+                                          maxLines: 1, 
+                                          overflow: TextOverflow.ellipsis, 
+                                          style: const TextStyle(color: Colors.grey)
                                         ),
-                                      )
-                                  ], 
-                                )
-                              : ListView.builder(
-                                  key: ValueKey(_isSearching ? 'search_list' : 'list_$_currentPath'),
-                                  physics: const AlwaysScrollableScrollPhysics(),
-                                  itemCount: currentList.length,
-                                  itemBuilder: (context, index) {
-                                    FileSystemEntity entity = currentList[index];
-                                    bool isDirectory = entity is Directory;
-                                    String name = entity.path.split('/').last;
-                                    bool isSelected = _selectedPaths.contains(entity.path);
-
-                                    // ========== 应用高亮的文本数据 ==========
-                                    String titleStr = isDirectory ? name : name.replaceAll('.md', '');
-                                    String subtitleStr = _isSearching 
-                                        ? (_searchThumbnails[entity.path] ?? '无内容') 
-                                        : (_thumbnails[entity.path] ?? '无内容');
-                                    String query = _isSearching ? _searchController.text.trim() : '';
-
-                                    return ListTile(
-                                      selected: isSelected,
-                                      selectedTileColor: Colors.green.shade50,
-                                      leading: isDirectory ? const Icon(Icons.folder, color: Colors.amber, size: 40) : null,
-                                      // ================= 使用自定义高亮渲染器 =================
-                                      title: _buildHighlightedText(
-                                        titleStr, 
-                                        query, 
-                                        style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)
-                                      ),
-                                      subtitle: isDirectory 
-                                          ? null 
-                                          : _buildHighlightedText(
-                                              subtitleStr, 
-                                              query, 
-                                              maxLines: 1, 
-                                              overflow: TextOverflow.ellipsis, 
-                                              style: const TextStyle(color: Colors.grey)
-                                            ),
-                                      // ========================================================
-                                      contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-                                      trailing: _isSelectionMode ? Checkbox(
-                                        activeColor: Colors.lightGreen,
-                                        value: isSelected, onChanged: (v) {
-                                        setState(() {
-                                          if (v == true) _selectedPaths.add(entity.path);
-                                          else _selectedPaths.remove(entity.path);
-                                        });
-                                      }) : null,
-                                      onLongPress: () {
-                                        setState(() => _selectedPaths.add(entity.path));
-                                      },
-                                      onTap: () {
-                                        if (_isSelectionMode) {
-                                          setState(() {
-                                            if (isSelected) _selectedPaths.remove(entity.path);
-                                            else _selectedPaths.add(entity.path);
-                                          });
-                                        } else {
-                                          if (isDirectory) {
+                                  contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                                  
+                                  // ==================== 修改部分：右侧展示复选框 或 文件夹子项统计 ====================
+                                  trailing: _isSelectionMode 
+                                      ? Checkbox(
+                                          activeColor: Colors.lightGreen,
+                                          value: isSelected, 
+                                          onChanged: (v) {
                                             setState(() {
-                                              _isGoingBack = false; 
-                                              _currentPath = entity.path;
-                                              if (_isSearching) {
-                                                _cancelSearch(); 
-                                              }
+                                              if (v == true) _selectedPaths.add(entity.path);
+                                              else _selectedPaths.remove(entity.path);
                                             });
-                                            _loadFiles(_currentPath);
-                                          } else {
-                                            Navigator.push(context, MaterialPageRoute(builder: (context) => NoteEditorPage(file: entity as File))).then((_) {
-                                              _loadFiles(_currentPath);
-                                              if (_isSearching) _performSearch(_searchController.text);
-                                            });
-                                          }
-                                        }
-                                      },
-                                    );
+                                          }) 
+                                      : (isDirectory 
+                                          ? Text(
+                                              _dirItemCounts[entity.path] ?? '', 
+                                              style: const TextStyle(color: Colors.grey, fontSize: 13)
+                                            ) 
+                                          : null),
+                                  // =================================================================================
+                                  
+                                  onLongPress: () {
+                                    setState(() => _selectedPaths.add(entity.path));
                                   },
-                                ),
-                        ),
+                                  onTap: () {
+                                    if (_isSelectionMode) {
+                                      setState(() {
+                                        if (isSelected) _selectedPaths.remove(entity.path);
+                                        else _selectedPaths.add(entity.path);
+                                      });
+                                    } else {
+                                      if (isDirectory) {
+                                        setState(() {
+                                          _isGoingBack = false; 
+                                          _currentPath = entity.path;
+                                          if (_isSearching) {
+                                            _cancelSearch(); 
+                                          }
+                                        });
+                                        _loadFiles(_currentPath);
+                                      } else {
+                                        Navigator.push(context, MaterialPageRoute(builder: (context) => NoteEditorPage(file: entity as File))).then((_) {
+                                          _loadFiles(_currentPath);
+                                          if (_isSearching) _performSearch(_searchController.text);
+                                        });
+                                      }
+                                    }
+                                  },
+                                );
+                              },
+                            ),
+                    ),
+                  ),
+                  if ((_isSearching && _isSearchingLoading) || (!_isSearching && _isLoading))
+                    const Positioned(
+                      top: 0, left: 0, right: 0,
+                      child: LinearProgressIndicator(
+                        minHeight: 3,
+                        backgroundColor: Colors.transparent,
+                        valueColor: AlwaysStoppedAnimation<Color>(Colors.lightGreen),
                       ),
+                    ),
+                ],
+              ),
             ),
             if (_isSyncing)
               Container(
