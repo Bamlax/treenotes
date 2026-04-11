@@ -149,6 +149,7 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
 
     String parentPath = _currentFile.parent.path;
     String newPath = '$parentPath/$newName.md';
+    String oldPath = _currentFile.path;
 
     if (File(newPath).existsSync()) {
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('该名称已存在！')));
@@ -163,6 +164,20 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
     try {
       await _saveFile(silent: true);
       File renamedFile = await _currentFile.rename(newPath);
+      
+      // ================= 修复：记录旧文件路径，以便同步时通知云端删除 =================
+      final prefs = await SharedPreferences.getInstance();
+      String rootPath = prefs.getString('root_path') ?? '';
+      if (rootPath.isNotEmpty && oldPath.startsWith(rootPath)) {
+        String relPath = oldPath.replaceFirst(rootPath, '');
+        List<String> deletes = prefs.getStringList('pending_deletes') ?? [];
+        if (!deletes.contains(relPath)) {
+          deletes.add(relPath);
+          await prefs.setStringList('pending_deletes', deletes);
+        }
+      }
+      // =======================================================================
+
       if (!mounted) return; 
       setState(() {
         _currentFile = renamedFile;
@@ -265,30 +280,24 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
     }
   }
 
-  // ==================== 新增：处理双向链接跳转 ====================
   Future<void> _handleWikilinkTap(String noteName) async {
     String targetPath = '${_currentFile.parent.path}/$noteName.md';
     File targetFile = File(targetPath);
 
-    // 如果文件不存在，直接创建空笔记
     if (!targetFile.existsSync()) {
       await targetFile.writeAsString(NoteUtil.generateInitialContent());
     }
 
     if (mounted) {
-      // 保存当前笔记
       await _saveFile(silent: true);
-      // 跳转到目标笔记
       Navigator.push(
         context,
         MaterialPageRoute(builder: (context) => NoteEditorPage(file: targetFile)),
       ).then((_) {
-        // 返回时重新加载当前笔记（防止在别处被修改）
         _loadSettingsAndContent();
       });
     }
   }
-  // ==============================================================
 
   @override
   void dispose() {
@@ -353,7 +362,6 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
       body: _isLoading
           ? const Center(child: CircularProgressIndicator())
           : _isPreviewMode
-              // ======================= 阅读模式 =======================
               ? SingleChildScrollView(
                   padding: const EdgeInsets.all(16.0),
                   child: Column(
@@ -386,13 +394,11 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
                         builder: (context) {
                           String displayData = _bodyController.text;
 
-                          // 1. 修复空待办 Bug
                           displayData = displayData.replaceAllMapped(
                             RegExp(r'^([ \t]*[-*+]\s+\[[ xX]\])\s*$', multiLine: true),
                             (match) => '${match.group(1)} \u200B',
                           );
 
-                          // 2. 将 [[双向链接]] 转换为标准 Markdown 链接 [笔记名](wikilink:笔记名)
                           displayData = displayData.replaceAllMapped(
                             RegExp(r'\[\[(.*?)\]\]'),
                             (match) {
@@ -410,17 +416,14 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
                               listBullet: const TextStyle(fontSize: 16, height: 1.6),
                               listIndent: 20, 
                               blockSpacing: 10.0,
-                              // 把双向链接染成不同的颜色以示区分
                               a: TextStyle(color: Colors.green.shade700, decoration: TextDecoration.underline), 
                             ),
-                            // ==================== 拦截点击事件 ====================
                             onTapLink: (text, href, title) {
                               if (href != null && href.startsWith('wikilink:')) {
                                 String noteName = Uri.decodeComponent(href.replaceFirst('wikilink:', ''));
                                 _handleWikilinkTap(noteName);
                               }
                             },
-                            // ======================================================
                             checkboxBuilder: (bool checked) {
                               int currentIndex = checkboxCounter++;
                               return InkWell(
@@ -444,7 +447,6 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
                     ],
                   ),
                 )
-              // ======================= 编辑模式 =======================
               : Column(
                   children: [
                     Expanded(
@@ -527,9 +529,7 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
                             _buildToolbarBtn(Icons.code, '`', '`', tooltip: '行内代码'),
                             _buildToolbarBtn(Icons.terminal, '```\n', '\n```', tooltip: '代码块'),
                             _buildToolbarBtn(Icons.link, '[', '](url)', tooltip: '链接'),
-                            // ==================== 新增：双链快捷按钮 ====================
                             _buildToolbarBtn(Icons.cable, '[[', ']]', tooltip: '双向链接'),
-                            // ==========================================================
                             _buildToolbarBtn(Icons.image, '![', '](url)', tooltip: '图片'),
                             _buildToolbarBtn(Icons.functions, r'$$', r'$$', tooltip: '数学公式'),
                           ],
