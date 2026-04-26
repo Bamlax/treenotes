@@ -19,6 +19,10 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage> {
+  bool _isAppInitializing = true;
+  bool _enableAnimations = false; 
+  bool _frameDeferred = false; // 用于控制开屏 Logo
+  
   String _rootPath = '';
   String _currentPath = '';
   String _renderedPath = ''; 
@@ -30,13 +34,12 @@ class _HomePageState extends State<HomePage> {
   List<FileSystemEntity> _searchResults = [];
   final TextEditingController _searchController = TextEditingController();
   Timer? _searchDebounce;
-  Map<String, String> _searchThumbnails = {}; 
-
-  Map<String, String> _thumbnails = {};
-  Map<String, DateTime> _createdTimes = {};
-  Map<String, DateTime> _modifiedTimes = {};
   
-  Map<String, String> _dirItemCounts = {};
+  final Map<String, String> _searchThumbnails = {}; 
+  final Map<String, String> _thumbnails = {};
+  final Map<String, DateTime> _createdTimes = {};
+  final Map<String, DateTime> _modifiedTimes = {};
+  final Map<String, String> _dirItemCounts = {};
   
   bool _isLoading = true;
   SortMethod _currentSort = SortMethod.nameAsc;
@@ -49,16 +52,60 @@ class _HomePageState extends State<HomePage> {
   
   bool _isGoingBack = false;
 
+  bool _isEditingDirName = false;
+  bool _isRenamingDir = false;
+  final TextEditingController _dirNameController = TextEditingController();
+  final FocusNode _dirNameFocusNode = FocusNode();
+
   @override
   void initState() {
     super.initState();
+    
+    // 核心：强制拦截系统的开屏 Logo，不让它消失，直到我们把文件读完
+    try {
+      WidgetsBinding.instance.deferFirstFrame();
+      _frameDeferred = true;
+    } catch (_) {}
+
+    _dirNameFocusNode.addListener(() {
+      if (!_dirNameFocusNode.hasFocus && _isEditingDirName) {
+        _commitDirRename();
+      }
+    });
+    
     _initApp();
   }
 
   Future<void> _initApp() async {
     await _loadSortMethod();
     await _requestPermissions();
+    // 等待本地文件数据一次性直读完毕
     await _initRootDirectory();
+    
+    if (mounted) {
+      setState(() {
+        _isAppInitializing = false;
+      });
+      
+      // 数据准备就绪，放行系统的开屏 Logo，此时第一帧必定满载数据
+      if (_frameDeferred) {
+        WidgetsBinding.instance.allowFirstFrame();
+      }
+
+      // 后台静默提取 YAML 属性和正文摘要（不会阻塞界面展示）
+      final prefs = await SharedPreferences.getInstance();
+      bool showYaml = prefs.getBool('show_yaml_in_thumbnail') ?? false;
+      _loadThumbnailsInBackground(_files, showYaml);
+      
+      // 延迟 50 毫秒后再开启滑动动画能力，确保首开是 100% 静态直接呈现
+      Future.delayed(const Duration(milliseconds: 50), () {
+        if (mounted) {
+          setState(() {
+            _enableAnimations = true;
+          });
+        }
+      });
+    }
   }
 
   Future<void> _loadSortMethod() async {
@@ -72,7 +119,9 @@ class _HomePageState extends State<HomePage> {
   Future<void> _saveSortMethod(SortMethod method) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setInt('sort_method', method.index);
-    setState(() => _currentSort = method);
+    setState(() {
+      _currentSort = method;
+    });
     _sortFiles();
   }
 
@@ -90,14 +139,14 @@ class _HomePageState extends State<HomePage> {
     String? savedPath = prefs.getString('root_path');
 
     if (savedPath != null && Directory(savedPath).existsSync()) {
-      setState(() {
-        _rootPath = savedPath;
-        _currentPath = savedPath;
-        _renderedPath = savedPath; 
-      });
-      await _loadFiles(_currentPath);
+      _rootPath = savedPath;
+      _currentPath = savedPath;
+      _renderedPath = savedPath; 
+      // 直接同步读取，不再经历 Loading 阶段
+      _loadFilesSync(_currentPath);
+      _isLoading = false;
     } else {
-      setState(() => _isLoading = false);
+      _isLoading = false;
     }
   }
 
@@ -111,7 +160,6 @@ class _HomePageState extends State<HomePage> {
         _rootPath = selectedDirectory;
         _currentPath = selectedDirectory;
         _renderedPath = selectedDirectory;
-        _isLoading = true; 
       });
       await _loadFiles(_currentPath);
     }
@@ -171,11 +219,8 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  Future<void> _loadFiles(String path) async {
-    setState(() => _isLoading = true); 
-    final prefs = await SharedPreferences.getInstance();
-    bool showYaml = prefs.getBool('show_yaml_in_thumbnail') ?? false;
-
+  // 极速同步读取方法（解决空状态动画的核心）
+  void _loadFilesSync(String path) {
     try {
       Directory dir = Directory(path);
       List<FileSystemEntity> entities = dir.listSync();
@@ -184,50 +229,91 @@ class _HomePageState extends State<HomePage> {
         return entity is Directory || entity.path.toLowerCase().endsWith('.md');
       });
 
-      _thumbnails.clear();
-      _createdTimes.clear();
-      _modifiedTimes.clear();
       _dirItemCounts.clear(); 
-
       for (var entity in entities) {
         if (entity is Directory) {
           _dirItemCounts[entity.path] = _getDirCountText(entity);
-        } else if (entity is File) {
-          try {
-            String content = await entity.readAsString();
-            Map<String, String> props = NoteUtil.parseFrontmatter(content);
-            
-            DateTime? created = NoteUtil.getYamlTime(content, 'created');
-            DateTime? modified = NoteUtil.getYamlTime(content, 'modified');
-            if (created != null) _createdTimes[entity.path] = created;
-            if (modified != null) _modifiedTimes[entity.path] = modified;
-
-            String textOnly = NoteUtil.extractBody(content).replaceAll('\n', ' ').trim();
-            
-            if (showYaml) {
-              String yamlSummary = '';
-              props.forEach((k, v) {
-                if (k != 'created' && k != 'modified' && k != 'synced' && v.isNotEmpty) {
-                  yamlSummary += '[$k: $v] ';
-                }
-              });
-              textOnly = yamlSummary + textOnly;
-            }
-            
-            _thumbnails[entity.path] = textOnly.length > 50 ? '${textOnly.substring(0, 50)}...' : textOnly;
-          } catch (e) {
-            _thumbnails[entity.path] = "无法读取内容";
-          }
         }
       }
 
       _files = entities;
       _renderedPath = path; 
       _selectedPaths.clear(); 
-      _sortFiles();
-      _isLoading = false;
+      _sortFileArray(_files);
     } catch (e) {
-      setState(() => _isLoading = false);
+      _files = [];
+    }
+  }
+
+  // 页面导航或手动刷新时调用
+  Future<void> _loadFiles(String path) async {
+    setState(() { _isLoading = true; }); 
+    
+    // 瞬间准备好数据
+    _loadFilesSync(path);
+
+    if (!mounted) return;
+    setState(() { _isLoading = false; });
+    
+    // 把读取内容这件耗时的事丢在背后做
+    final prefs = await SharedPreferences.getInstance();
+    bool showYaml = prefs.getBool('show_yaml_in_thumbnail') ?? false;
+    _loadThumbnailsInBackground(_files, showYaml);
+  }
+
+  Future<void> _loadThumbnailsInBackground(List<FileSystemEntity> entities, bool showYaml) async {
+    bool needsRebuild = false;
+    
+    for (var entity in entities) {
+      if (entity is File) {
+        try {
+          String content = await entity.readAsString();
+          Map<String, String> props = NoteUtil.parseFrontmatter(content);
+          
+          DateTime? created = NoteUtil.getYamlTime(content, 'created');
+          DateTime? modified = NoteUtil.getYamlTime(content, 'modified');
+          
+          bool timeChanged = false;
+          if (created != null && _createdTimes[entity.path] != created) {
+            _createdTimes[entity.path] = created;
+            timeChanged = true;
+          }
+          if (modified != null && _modifiedTimes[entity.path] != modified) {
+            _modifiedTimes[entity.path] = modified;
+            timeChanged = true;
+          }
+
+          String textOnly = NoteUtil.extractBody(content).replaceAll('\n', ' ').trim();
+          
+          if (showYaml) {
+            String yamlSummary = '';
+            props.forEach((k, v) {
+              if (k != 'created' && k != 'modified' && k != 'synced' && v.isNotEmpty) {
+                yamlSummary += '[$k: $v] ';
+              }
+            });
+            textOnly = yamlSummary + textOnly;
+          }
+          
+          String newThumb = textOnly.length > 150 ? '${textOnly.substring(0, 150)}...' : textOnly;
+          if (_thumbnails[entity.path] != newThumb) {
+            _thumbnails[entity.path] = newThumb;
+            needsRebuild = true;
+          } else if (timeChanged) {
+            needsRebuild = true;
+          }
+        } catch (e) {
+          if (_thumbnails[entity.path] != "无法读取内容") {
+            _thumbnails[entity.path] = "无法读取内容";
+            needsRebuild = true;
+          }
+        }
+      }
+    }
+    
+    if (mounted && needsRebuild) {
+      setState(() {});
+      _sortFiles();
     }
   }
 
@@ -244,6 +330,8 @@ class _HomePageState extends State<HomePage> {
     setState(() => _isSearchingLoading = true);
     
     final prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
+    
     bool showYaml = prefs.getBool('show_yaml_in_thumbnail') ?? false;
 
     String lowerQuery = query.toLowerCase();
@@ -286,10 +374,10 @@ class _HomePageState extends State<HomePage> {
               int matchIdx = textOnly.toLowerCase().indexOf(lowerQuery);
               if (matchIdx != -1) {
                 int start = (matchIdx - 15).clamp(0, textOnly.length);
-                int end = (matchIdx + lowerQuery.length + 20).clamp(0, textOnly.length);
+                int end = (matchIdx + lowerQuery.length + 80).clamp(0, textOnly.length); 
                 displaySnippet = (start > 0 ? '...' : '') + textOnly.substring(start, end) + (end < textOnly.length ? '...' : '');
               } else {
-                displaySnippet = textOnly.length > 50 ? '${textOnly.substring(0, 50)}...' : textOnly;
+                displaySnippet = textOnly.length > 150 ? '${textOnly.substring(0, 150)}...' : textOnly;
               }
               
               if (showYaml) {
@@ -356,9 +444,7 @@ class _HomePageState extends State<HomePage> {
       start = indexOfMatch + query.length;
     }
 
-    if (start < text.length) {
-      spans.add(TextSpan(text: text.substring(start), style: style));
-    }
+    if (start < text.length) spans.add(TextSpan(text: text.substring(start), style: style));
 
     return Text.rich(
       TextSpan(children: spans, style: style), 
@@ -367,7 +453,6 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  // ================= 修复：提取一个共用的待删除记录方法 =================
   Future<void> _recordPendingDelete(String path) async {
     String relPath = path.replaceFirst(_rootPath, '');
     final prefs = await SharedPreferences.getInstance();
@@ -377,7 +462,53 @@ class _HomePageState extends State<HomePage> {
       await prefs.setStringList('pending_deletes', deletes);
     }
   }
-  // =================================================================
+
+  Future<void> _commitDirRename() async {
+    if (!mounted || _isRenamingDir) return;
+    _isRenamingDir = true;
+
+    String oldName = _currentPath.split('/').last;
+    String newName = _dirNameController.text.trim();
+
+    if (newName.isEmpty || newName == oldName) {
+      setState(() => _isEditingDirName = false);
+      _isRenamingDir = false;
+      return;
+    }
+
+    String parentPath = Directory(_currentPath).parent.path;
+    String newPath = '$parentPath/$newName';
+
+    if (Directory(newPath).existsSync() || File(newPath).existsSync()) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('该名称已存在！')));
+        setState(() => _isEditingDirName = false);
+      }
+      _isRenamingDir = false;
+      return;
+    }
+
+    try {
+      await _recordPendingDelete(_currentPath); 
+      if (!mounted) return;
+      
+      Directory(_currentPath).renameSync(newPath);
+
+      setState(() {
+        _currentPath = newPath;
+        _renderedPath = newPath;
+        _isEditingDirName = false;
+      });
+      _loadFiles(_currentPath);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('重命名失败：$e')));
+        setState(() => _isEditingDirName = false);
+      }
+    } finally {
+      _isRenamingDir = false;
+    }
+  }
 
   void _deleteSelected() async {
     bool? confirmed = await showDialog(
@@ -408,7 +539,7 @@ class _HomePageState extends State<HomePage> {
       }
 
       for (String path in _selectedPaths) {
-        await _recordPendingDelete(path); // 记录本地删除以便同步
+        await _recordPendingDelete(path); 
 
         String relativePath = path.replaceFirst(_rootPath, '');
         String remotePath = '/TreeNotes$relativePath';
@@ -419,10 +550,10 @@ class _HomePageState extends State<HomePage> {
           File(path).deleteSync();
         }
         
-        if (client != null) {
-          try { await client.removeAll(remotePath); } catch (_) {} 
-        }
+        try { await client?.removeAll(remotePath); } catch (_) {} 
       }
+      
+      if (!mounted) return;
       _loadFiles(_currentPath);
       if (_isSearching) _performSearch(_searchController.text);
     }
@@ -468,10 +599,11 @@ class _HomePageState extends State<HomePage> {
           String newPath = '$targetPath/$name';
           
           if (path != newPath && !targetPath.toString().startsWith(path)) {
-            await _recordPendingDelete(path); // 记录移动前的旧路径
+            await _recordPendingDelete(path); 
             entity.renameSync(newPath);
           }
         }
+        if (!mounted) return;
         _loadFiles(_currentPath);
         if (_isSearching) _performSearch(_searchController.text);
       }
@@ -495,9 +627,7 @@ class _HomePageState extends State<HomePage> {
           DateTime? synced = NoteUtil.getYamlTime(content, 'synced');
           
           if (modified != null && synced != null) {
-            if (!modified.isAfter(synced)) {
-              needsUpload = false; 
-            }
+            if (!modified.isAfter(synced)) needsUpload = false; 
           }
         } catch (_) {}
 
@@ -531,9 +661,7 @@ class _HomePageState extends State<HomePage> {
             DateTime? remoteTime = file.mTime;
             
             if (remoteTime != null && synced != null) {
-              if (remoteTime.difference(synced).inSeconds <= 60) {
-                needsDownload = false;
-              }
+              if (remoteTime.difference(synced).inSeconds <= 60) needsDownload = false;
             }
           } catch (_) {}
         }
@@ -560,30 +688,30 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _syncCloud() async {
     final prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
+    
     String davUrl = prefs.getString('dav_url') ?? '';
     String davUser = prefs.getString('dav_user') ?? '';
     String davPwd = prefs.getString('dav_pwd') ?? '';
 
     if (davUrl.isEmpty || davUser.isEmpty || davPwd.isEmpty) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('请先在设置中配置 WebDAV 账号')));
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('请先在设置中配置 WebDAV 账号')));
       return;
     }
 
-    if (mounted) setState(() { _isSyncing = true; _syncMessage = '连接服务器...'; });
+    setState(() { _isSyncing = true; _syncMessage = '连接服务器...'; });
 
     try {
       var client = webdav.newClient(davUrl, user: davUser, password: davPwd);
       await client.ping();
       try { await client.mkdir('/TreeNotes'); } catch (_) {}
       
-      // ================= 修复：同步前清理掉本地被重命名、移动或删除的幽灵文件 =================
       List<String> deletes = prefs.getStringList('pending_deletes') ?? [];
       for (String relPath in deletes) {
         if (mounted) setState(() => _syncMessage = '清理云端失效文件...');
         try { await client.removeAll('/TreeNotes$relPath'); } catch (_) {}
       }
       await prefs.setStringList('pending_deletes', []); 
-      // ==============================================================================
 
       await _uploadDirectory(Directory(_rootPath), '/TreeNotes', client);
       await _downloadDirectory('/TreeNotes', _rootPath, client);
@@ -612,7 +740,9 @@ class _HomePageState extends State<HomePage> {
     File newFile = File('$_currentPath/$newFileName');
     await newFile.writeAsString(NoteUtil.generateInitialContent());
     
+    if (!mounted) return;
     await _loadFiles(_currentPath);
+    
     if (mounted) {
       Navigator.push(
         context,
@@ -644,9 +774,13 @@ class _HomePageState extends State<HomePage> {
                 if (controller.text.isNotEmpty) {
                   String name = controller.text.trim();
                   await Directory('$_currentPath/$name').create();
+                  
                   if (context.mounted) Navigator.pop(context);
-                  _loadFiles(_currentPath);
-                  if (_isSearching) _performSearch(_searchController.text);
+                  
+                  if (mounted) {
+                    _loadFiles(_currentPath);
+                    if (_isSearching) _performSearch(_searchController.text);
+                  }
                 }
               },
               style: ElevatedButton.styleFrom(backgroundColor: Colors.lightGreen.shade50, foregroundColor: Colors.green.shade800, elevation: 0),
@@ -658,8 +792,14 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  void _goBack() {
+  Future<void> _goBack() async {
     if (_currentPath != _rootPath) {
+      if (_isEditingDirName) {
+        FocusScope.of(context).unfocus(); 
+        await _commitDirRename();
+      }
+      
+      if (!mounted) return;
       setState(() {
         _isGoingBack = true; 
         _currentPath = Directory(_currentPath).parent.path;
@@ -672,11 +812,17 @@ class _HomePageState extends State<HomePage> {
   void dispose() {
     _searchDebounce?.cancel();
     _searchController.dispose();
+    _dirNameController.dispose();
+    _dirNameFocusNode.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
+    if (_isAppInitializing) {
+      return const SizedBox.shrink(); // 彻底用透明占位代替，由于使用了 deferFirstFrame 根本不会被展示
+    }
+
     if (_rootPath.isEmpty) {
       return Scaffold(
         appBar: AppBar(
@@ -730,6 +876,7 @@ class _HomePageState extends State<HomePage> {
               : (_isSearching 
                   ? IconButton(icon: const Icon(Icons.arrow_back), onPressed: _cancelSearch)
                   : (canGoBack ? IconButton(icon: const Icon(Icons.arrow_back), onPressed: _goBack) : null)),
+          
           title: _isSearching
               ? TextField(
                   controller: _searchController,
@@ -740,13 +887,31 @@ class _HomePageState extends State<HomePage> {
                     border: InputBorder.none,
                   ),
                   onChanged: (val) {
-                    if (_searchDebounce?.isActive ?? false) _searchDebounce!.cancel();
-                    _searchDebounce = Timer(const Duration(milliseconds: 500), () {
-                      _performSearch(val);
-                    });
+                    _searchDebounce?.cancel();
+                    _searchDebounce = Timer(const Duration(milliseconds: 500), () => _performSearch(val));
                   },
                 )
-              : Text(_isSelectionMode ? '已选择 ${_selectedPaths.length} 项' : (canGoBack ? _currentPath.split('/').last : 'TreeNotes')),
+              : (_isSelectionMode 
+                  ? Text('已选择 ${_selectedPaths.length} 项') 
+                  : (canGoBack 
+                      ? (_isEditingDirName 
+                          ? TextField(
+                              controller: _dirNameController,
+                              focusNode: _dirNameFocusNode,
+                              autofocus: true,
+                              style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w500, color: Colors.black87),
+                              decoration: const InputDecoration(border: InputBorder.none, isDense: true, contentPadding: EdgeInsets.zero, hintText: '文件夹名称'),
+                              onSubmitted: (_) => _commitDirRename(),
+                            )
+                          : GestureDetector(
+                              onTap: () {
+                                _dirNameController.text = _currentPath.split('/').last;
+                                setState(() => _isEditingDirName = true);
+                              },
+                              child: Text(_currentPath.split('/').last, style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w500, color: Colors.black87), overflow: TextOverflow.ellipsis),
+                            ))
+                      : const Text('TreeNotes', style: TextStyle(fontSize: 20, fontWeight: FontWeight.w500, color: Colors.black87)))),
+
           backgroundColor: _isSelectionMode ? Colors.lightGreen.shade100 : Theme.of(context).colorScheme.primaryContainer,
           actions: _isSelectionMode 
             ? [
@@ -797,7 +962,7 @@ class _HomePageState extends State<HomePage> {
                   RefreshIndicator(
                     onRefresh: _syncCloud,
                     child: AnimatedSwitcher(
-                      duration: const Duration(milliseconds: 350), 
+                      duration: _enableAnimations ? const Duration(milliseconds: 350) : Duration.zero, 
                       switchInCurve: Curves.easeOutQuart,
                       switchOutCurve: Curves.easeOutQuart,
                       layoutBuilder: (Widget? currentChild, List<Widget> previousChildren) {
@@ -810,18 +975,17 @@ class _HomePageState extends State<HomePage> {
                         );
                       },
                       transitionBuilder: (Widget child, Animation<double> animation) {
+                        if (!_enableAnimations) return child; 
+
                         final Key currentKey = _isSearching 
                             ? (currentList.isEmpty ? const ValueKey('empty_search') : const ValueKey('search_list'))
                             : (currentList.isEmpty ? ValueKey('empty_$_renderedPath') : ValueKey('list_$_renderedPath'));
                             
                         final bool isEntering = child.key == currentKey;
                         
-                        Offset beginOffset;
-                        if (_isGoingBack) {
-                          beginOffset = isEntering ? const Offset(-1.0, 0.0) : const Offset(1.0, 0.0);
-                        } else {
-                          beginOffset = isEntering ? const Offset(1.0, 0.0) : const Offset(-1.0, 0.0);
-                        }
+                        Offset beginOffset = _isGoingBack 
+                            ? (isEntering ? const Offset(-1.0, 0.0) : const Offset(1.0, 0.0))
+                            : (isEntering ? const Offset(1.0, 0.0) : const Offset(-1.0, 0.0));
 
                         return SlideTransition(
                           position: Tween<Offset>(begin: beginOffset, end: Offset.zero).animate(animation),
@@ -861,8 +1025,8 @@ class _HomePageState extends State<HomePage> {
 
                                   String titleStr = isDirectory ? name : name.replaceAll('.md', '');
                                   String subtitleStr = _isSearching 
-                                      ? (_searchThumbnails[entity.path] ?? '无内容') 
-                                      : (_thumbnails[entity.path] ?? '无内容');
+                                      ? (_searchThumbnails[entity.path] ?? '') 
+                                      : (_thumbnails[entity.path] ?? '');
                                   String query = _isSearching ? _searchController.text.trim() : '';
 
                                   return ListTile(
@@ -879,7 +1043,7 @@ class _HomePageState extends State<HomePage> {
                                         : _buildHighlightedText(
                                             subtitleStr, 
                                             query, 
-                                            maxLines: 1, 
+                                            maxLines: 2, 
                                             overflow: TextOverflow.ellipsis, 
                                             style: const TextStyle(color: Colors.grey)
                                           ),
@@ -900,9 +1064,7 @@ class _HomePageState extends State<HomePage> {
                                                 style: const TextStyle(color: Colors.grey, fontSize: 13)
                                               ) 
                                             : null),
-                                    onLongPress: () {
-                                      setState(() => _selectedPaths.add(entity.path));
-                                    },
+                                    onLongPress: () => setState(() => _selectedPaths.add(entity.path)),
                                     onTap: () {
                                       if (_isSelectionMode) {
                                         setState(() {
@@ -914,9 +1076,7 @@ class _HomePageState extends State<HomePage> {
                                           setState(() {
                                             _isGoingBack = false; 
                                             _currentPath = entity.path;
-                                            if (_isSearching) {
-                                              _cancelSearch(); 
-                                            }
+                                            if (_isSearching) _cancelSearch(); 
                                           });
                                           _loadFiles(_currentPath);
                                         } else {
@@ -932,7 +1092,7 @@ class _HomePageState extends State<HomePage> {
                               ),
                       ),
                     ),
-                  ),
+                  ), 
                   if ((_isSearching && _isSearchingLoading) || (!_isSearching && _isLoading))
                     const Positioned(
                       top: 0, left: 0, right: 0,

@@ -36,7 +36,6 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
   final FocusNode _titleFocusNode = FocusNode();
   bool _isEditingTitle = false;
   
-  // 新增：拦截退出防抖锁
   bool _isExiting = false;
 
   final Map<String, String> _timeProps = {};
@@ -47,7 +46,6 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
 
   Timer? _autoSaveTimer;
   
-  // 新增：任务锁，防止并发保存和重命名冲突
   Future<void>? _saveFuture;
   Future<void>? _renameFuture;
 
@@ -108,7 +106,6 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
     });
   }
 
-  // ================= 修复：使用并发锁保证文件保存安全 =================
   Future<void> _saveFile({bool silent = false}) async {
     if (_saveFuture != null) {
       await _saveFuture;
@@ -147,9 +144,7 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
       }
     }
   }
-  // ================================================================
 
-  // ================= 修复：使用并发锁保证重命名安全，避免冲突 =================
   Future<void> _commitRename() async {
     if (_renameFuture != null) {
       await _renameFuture;
@@ -216,7 +211,6 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
       });
     }
   }
-  // =========================================================================
 
   void _showInfoDialog() {
     int bytes = _currentFile.lengthSync();
@@ -327,8 +321,6 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
     _autoSaveTimer?.cancel();
     _bodyController.removeListener(_triggerAutoSave);
     
-    // 我们将统一的退出保存逻辑移交给了 PopScope
-    // 所以这里不需要再发起无主的异步保存了
     _bodyController.dispose();
     _titleFocusNode.dispose();
     _titleController.dispose();
@@ -341,24 +333,20 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
   Widget build(BuildContext context) {
     int checkboxCounter = 0;
 
-    // ================= 核心修复：利用 PopScope 完全接管物理返回键和 AppBar 退出 =================
     return PopScope(
-      canPop: false, // 阻止立刻退出
+      canPop: false, 
       onPopInvokedWithResult: (didPop, result) async {
         if (didPop || _isExiting) return;
         _isExiting = true;
 
-        // 强行取消键盘焦点
         FocusScope.of(context).unfocus();
 
-        // 强行等待（如果有正在重命名的操作，就等它改完；如果没有，就至少保证保存一下）
         if (_isEditingTitle) {
           await _commitRename();
         } else {
           await _saveFile(silent: true);
         }
 
-        // 文件读写全安全结束后，再执行真正的退出
         if (mounted) {
           Navigator.pop(context, result);
         }
@@ -367,19 +355,21 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
         appBar: AppBar(
           titleSpacing: 0,
           backgroundColor: Theme.of(context).colorScheme.primaryContainer,
+          // ================= 修复 1：使 TextField 和 Text 具有完全一致的 TextStyle 和排版属性 =================
           title: _isEditingTitle
               ? TextField(
                   controller: _titleController,
                   focusNode: _titleFocusNode,
                   autofocus: true,
-                  style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.black87),
-                  decoration: const InputDecoration(border: InputBorder.none, isDense: true, hintText: '笔记名称'),
+                  style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w500, color: Colors.black87),
+                  decoration: const InputDecoration(border: InputBorder.none, isDense: true, contentPadding: EdgeInsets.zero, hintText: '笔记名称'),
                   onSubmitted: (_) => _commitRename(),
                 )
               : GestureDetector(
                   onTap: () => setState(() => _isEditingTitle = true),
-                  child: Text(_titleController.text, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold), overflow: TextOverflow.ellipsis),
+                  child: Text(_titleController.text, style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w500, color: Colors.black87), overflow: TextOverflow.ellipsis),
                 ),
+          // =========================================================================================
           actions: [
             IconButton(
               icon: Icon(_isPreviewMode ? Icons.edit : Icons.preview),
